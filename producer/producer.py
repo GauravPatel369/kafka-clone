@@ -25,19 +25,20 @@ At 0.5 ms per round trip that caps you at ~2,000 messages/second no matter
 how fast the broker is. The broker is idle most of that time; so is the
 network; so is the producer. The bottleneck is pure latency.
 
-Real producers fix this two ways, and Phase 3 implements both:
+Real producers fix this two ways:
 
-  1. **Batching** — accumulate messages in memory for a few milliseconds
-     (`linger.ms`) and send them as one request. 100 messages in one round
-     trip instead of 100 round trips. Costs a little latency, multiplies
-     throughput by ~50x.
-  2. **Pipelining** — send the next request without waiting for the previous
-     acknowledgement, matching replies to requests by correlation ID
-     (Phase 1's protocol change is what makes this possible).
+  1. **Pipelining** — send the next request without waiting for the previous
+     acknowledgement, matching replies to requests by correlation ID. Removes
+     the *waiting*. Available now via `send_pipelined()`, because the Phase 1
+     header carries a correlation_id.
+  2. **Batching** — accumulate messages in memory for a few milliseconds
+     (`linger.ms`) and send them as ONE request. Removes the waiting *and* the
+     per-message overhead. Phase 3.
 
-Both are the same insight: **the round trip is the expensive part, so amortise
-it.** Keep the Phase 0 number from `bench/bench.py` — the improvement in
-Phase 3 is one of the most dramatic in the project.
+Both are the same insight — **the round trip is the expensive part, so
+amortise it** — applied at different levels. They compose. Compare
+`send_many` (neither) against `send_pipelined` (one of them) in
+`bench/bench.py`; Phase 3 adds the third row.
 
 
 WHAT THE PRODUCER DECIDES
@@ -51,8 +52,9 @@ but not yet used for routing — every message goes to partition 0.
 import argparse
 
 from common.config import DEFAULT_HOST, DEFAULT_PORT
+from common.errors import raise_for_error
 from common.net import SyncConnection
-from common.protocol import MSG_PRODUCE
+from common.protocol import API_PRODUCE
 
 
 class Producer:
@@ -120,19 +122,13 @@ class Producer:
           meaningful by adding replicas. Right now every send is effectively
           `acks=1` against a single copy.
         """
-        response = self._conn.request(MSG_PRODUCE, {
-            'topic':     self.topic,
-            'partition': partition,
-            'value':     value,
-            'key':       key,
-        })
+        response = self._conn.request(API_PRODUCE, self._payload(value, key, partition))
 
-        if response.get('status') != 'ok':
-            # Phase 1 replaces this string with a numeric error code, which
-            # is what lets a client decide *programmatically* whether an
-            # error is worth retrying. Matching on error prose is not a plan.
-            raise RuntimeError(
-                f"Broker rejected the message: {response.get('reason', response)}")
+        # raise_for_error turns a numeric error_code into the right typed
+        # exception. Every client call routes through it, so error handling
+        # cannot be accidentally skipped at one call site — the most common
+        # way error handling rots.
+        raise_for_error(response, topic=self.topic, partition=partition)
 
         offset = response['offset']
         self._log(f"SENT value={value!r} key={key!r} → "
@@ -141,16 +137,72 @@ class Producer:
 
     def send_many(self, values, key: str = None, partition: int = 0) -> list:
         """
-        Convenience wrapper: send an iterable of values, return their offsets.
+        Send an iterable of values one at a time; return their offsets.
 
-        Note this is NOT batching — it is a loop of individual round trips,
-        with all the cost described in the module docstring. Real batching
-        arrives in Phase 3, and the benchmark difference between this method
-        and that one is the point.
+        NOT batching, and not pipelining either — a plain loop of individual
+        round trips, with all the cost described in the module docstring. Kept
+        as the honest baseline that `send_pipelined` is measured against.
         """
         return [self.send(v, key=key, partition=partition) for v in values]
 
+    def send_pipelined(self, values, key: str = None, partition: int = 0) -> list:
+        """
+        Send many messages without waiting for each acknowledgement.
+
+        CONCEPT: pipelining — the Phase 1 payoff.
+          `send_many` waits for a reply before sending the next request, so N
+          messages cost N round trips. This puts all N requests on the wire
+          first, then collects the replies, matching them by correlation ID.
+          N messages, one round trip.
+
+          It is only possible because the Phase 1 header carries a
+          correlation_id. Without one the replies would be unmatchable, and
+          waiting would be the only safe design.
+
+        Pipelining is NOT batching, and the difference matters:
+
+            pipelining   N requests in flight at once. Removes the WAITING.
+                         Per-message overhead (a 16-byte header, a JSON
+                         object, a broker dispatch) is unchanged.
+            batching     N messages inside ONE request. Removes the
+                         per-message OVERHEAD as well.
+
+          They compose, and Phase 3 uses both. Batching is the bigger win;
+          pipelining is the one the protocol just unlocked.
+
+        CAVEAT: sending an unbounded number of requests before reading any
+        reply can deadlock — we fill our send buffer while the broker fills
+        its own with replies nobody is draining. Real clients cap in-flight
+        requests (`max.in.flight.requests.per.connection`) for this reason.
+        Keep batches to a few hundred.
+        """
+        values = list(values)
+        if not values:
+            return []
+
+        responses = self._conn.pipeline([
+            (API_PRODUCE, self._payload(value, key, partition)) for value in values
+        ])
+
+        offsets = []
+        for response in responses:
+            raise_for_error(response, topic=self.topic, partition=partition)
+            offsets.append(response['offset'])
+
+        self._log(f"SENT {len(offsets)} messages pipelined → "
+                  f"{self.topic}-{partition} offsets "
+                  f"{offsets[0]}..{offsets[-1]}")
+        return offsets
+
     # ── Internals ──────────────────────────────────────────────
+
+    def _payload(self, value: str, key, partition: int) -> dict:
+        return {
+            'topic':     self.topic,
+            'partition': partition,
+            'value':     value,
+            'key':       key,
+        }
 
     def _log(self, message: str) -> None:
         if not self.quiet:

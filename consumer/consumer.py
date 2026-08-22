@@ -69,8 +69,11 @@ from common.config import (
     DEFAULT_HOST, DEFAULT_MAX_MESSAGES, DEFAULT_OFFSET_DIR,
     DEFAULT_POLL_INTERVAL, DEFAULT_PORT,
 )
+from common.errors import UnknownTopicOrPartitionError, raise_for_error
 from common.net import SyncConnection
-from common.protocol import MSG_FETCH
+from common.protocol import (
+    API_FETCH, API_LIST_OFFSETS, TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
+)
 
 
 class Consumer:
@@ -79,7 +82,7 @@ class Consumer:
 
     "One partition" is a real Phase 0 limitation. A consumer *group* that
     splits many partitions across many members — and reassigns them when a
-    member dies — is Phase 4. Here, `group_id` only namespaces the offset
+    member dies - is Phase 4. Here, `group_id` only namespaces the offset
     file, so two consumers in the same group both read everything and fight
     over the same file.
     """
@@ -148,15 +151,20 @@ class Consumer:
         Advances `position` in memory. **Commits nothing.** Call `commit()`
         once you have actually processed what you got back.
         """
-        response = self._conn.request(MSG_FETCH, {
+        response = self._conn.request(API_FETCH, {
             'topic':     self.topic,
             'partition': self.partition,
             'offset':    self.position,
             'max':       max_messages,
         })
 
-        if response.get('status') != 'ok':
-            raise RuntimeError(f"Fetch failed: {response.get('reason', response)}")
+        # Raises the typed exception matching the numeric error code. The one
+        # worth handling here is OffsetOutOfRangeError: it means our saved
+        # position no longer exists in the log — usually because retention
+        # deleted it while we were behind. See seek_to_beginning/seek_to_end,
+        # which are the two possible recoveries (Kafka's `auto.offset.reset`).
+        raise_for_error(response, topic=self.topic, partition=self.partition,
+                        offset=self.position)
 
         messages = response.get('messages', [])
         self.high_watermark = response.get('high_watermark', self.position)
@@ -219,8 +227,60 @@ class Consumer:
         self._log(f"seek → {offset}")
 
     def seek_to_beginning(self) -> None:
-        """Replay the partition from the start."""
-        self.seek(0)
+        """
+        Move to the oldest offset the broker still holds.
+
+        Asks the broker rather than assuming 0: once Phase 2's retention
+        starts deleting old segments, the earliest surviving offset is no
+        longer 0, and seeking to 0 would raise OFFSET_OUT_OF_RANGE.
+        """
+        self.seek(self._list_offset(TIMESTAMP_EARLIEST))
+
+    def seek_to_end(self) -> None:
+        """
+        Skip everything currently stored and read only new messages.
+
+        CONCEPT: the two halves of Kafka's `auto.offset.reset`.
+          When a consumer has no valid position — first run, or its saved
+          offset aged out — it must choose:
+
+            earliest  process the whole history. Correct for anything that
+                      must not miss data; expensive, and it reprocesses.
+            latest    start from now. Correct for live dashboards and
+                      metrics; SILENTLY SKIPS everything that arrived while
+                      you were away.
+
+          There is no safe default, which is why Kafka makes you pick and why
+          picking `latest` is behind a surprising number of "we lost a day of
+          events" incidents.
+
+        Uses LIST_OFFSETS rather than fetching-and-discarding: the broker
+        answers from metadata in constant time, with no data transferred.
+        """
+        self.seek(self._list_offset(TIMESTAMP_LATEST))
+
+    def _list_offset(self, timestamp: int) -> int:
+        """
+        Ask the broker for the earliest or latest offset in this partition.
+
+        LIST_OFFSETS is a query, so — unlike PRODUCE and FETCH — it does not
+        auto-create the partition; a topic nobody has written to yet is
+        genuinely unknown. For a seek that is not worth failing over: an empty
+        partition starts at 0 whichever end you asked for, so we fall back
+        rather than making the caller handle a distinction with no consequence.
+        """
+        response = self._conn.request(API_LIST_OFFSETS, {
+            'topic':     self.topic,
+            'partition': self.partition,
+            'timestamp': timestamp,
+        })
+        try:
+            raise_for_error(response, topic=self.topic, partition=self.partition)
+        except UnknownTopicOrPartitionError:
+            self._log(f"{self.topic}-{self.partition} does not exist yet; "
+                      f"starting at 0")
+            return 0
+        return response['offset']
 
     # ── The loop ───────────────────────────────────────────────
 
