@@ -111,6 +111,17 @@ class Partition:
         # skipping damage is how you lose data without ever noticing.
         self.corrupt_lines = 0
 
+        # The oldest offset still readable. Always 0 today, because nothing is
+        # ever deleted. Phase 2's retention will delete whole segments off the
+        # front, at which point this becomes non-zero — and a consumer asking
+        # for an offset below it gets OFFSET_OUT_OF_RANGE, meaning "you fell
+        # so far behind that your data is gone". That is the failure consumer
+        # lag monitoring exists to prevent.
+        #
+        # Defined now so LIST_OFFSETS (Phase 1) reports it, rather than
+        # hardcoding a 0 that later has to be hunted down.
+        self.log_start_offset = 0
+
         self.next_offset = self._recover_offset()
 
         # CONCEPT: Open the file ONCE and keep the handle.
