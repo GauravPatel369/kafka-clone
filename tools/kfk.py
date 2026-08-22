@@ -38,51 +38,112 @@ import sys
 from common.config import (
     DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_OFFSET_DIR, DEFAULT_PORT,
 )
+from common.errors import ERROR_NAMES, KafkaError, raise_for_error
 from common.net import BrokerConnectionError, SyncConnection
-from common.protocol import MSG_FETCH
+from common.protocol import (
+    API_FETCH, API_LIST_OFFSETS, API_METADATA,
+    TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
+)
+
+
+def _request(args, api_key: int, payload: dict) -> dict:
+    with SyncConnection(args.host, args.port, timeout=10.0) as conn:
+        return raise_for_error(conn.request(api_key, payload))
 
 
 def _fetch(args, offset: int, max_messages: int) -> dict:
-    with SyncConnection(args.host, args.port, timeout=10.0) as conn:
-        return conn.request(MSG_FETCH, {
-            'topic': args.topic,
-            'partition': args.partition,
-            'offset': offset,
-            'max': max_messages,
-        })
+    return _request(args, API_FETCH, {
+        'topic': args.topic,
+        'partition': args.partition,
+        'offset': offset,
+        'max': max_messages,
+    })
 
 
 # ── Commands ───────────────────────────────────────────────────
 
-def cmd_describe(args) -> int:
-    """Ask the live broker about a partition."""
-    response = _fetch(args, offset=0, max_messages=1)
+def cmd_metadata(args) -> int:
+    """
+    Ask the broker to describe the cluster and every topic on it.
 
-    high_watermark = response.get('high_watermark', 0)
+    This is the request a real Kafka client makes before it sends anything:
+    it learns which broker leads which partition and connects there directly,
+    with no proxy in the data path. Phase 5 makes the broker list longer than
+    one; the shape of the answer does not change.
+    """
+    response = _request(args, API_METADATA,
+                        {'topics': [args.topic] if args.topic else None})
+
+    print("BROKERS")
+    for broker in response['brokers']:
+        marker = '  (controller)' if broker['node_id'] == response['controller_id'] else ''
+        print(f"  {broker['node_id']}: {broker['host']}:{broker['port']}{marker}")
+
+    print("\nTOPICS")
+    if not response['topics']:
+        print("  (none yet — produce something first)")
+
+    for topic in response['topics']:
+        if topic['error_code'] != 0:
+            print(f"  {topic['name']}: "
+                  f"{ERROR_NAMES.get(topic['error_code'], topic['error_code'])}")
+            continue
+        print(f"  {topic['name']}")
+        print(f"    {'PART':<6}{'LEADER':<8}{'REPLICAS':<12}{'ISR':<12}"
+              f"{'START':<8}{'END':<8}")
+        for part in topic['partitions']:
+            print(f"    {part['partition']:<6}{part['leader']:<8}"
+                  f"{str(part['replicas']):<12}{str(part['isr']):<12}"
+                  f"{part['log_start_offset']:<8}{part['high_watermark']:<8}")
+    return 0
+
+
+def cmd_describe(args) -> int:
+    """
+    Ask the live broker about one partition.
+
+    Phase 0 did this by fetching a message and reading `high_watermark` off
+    the response — it worked, but it transferred data to answer a metadata
+    question. LIST_OFFSETS answers both ends in constant time and zero bytes
+    of payload, which is exactly why the API exists.
+    """
+    earliest = _request(args, API_LIST_OFFSETS, {
+        'topic': args.topic, 'partition': args.partition,
+        'timestamp': TIMESTAMP_EARLIEST})['offset']
+    latest = _request(args, API_LIST_OFFSETS, {
+        'topic': args.topic, 'partition': args.partition,
+        'timestamp': TIMESTAMP_LATEST})['offset']
+
+    count = latest - earliest
     log_path = os.path.join(args.data_dir, f"{args.topic}-{args.partition}.log")
     size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
 
     print(f"Topic     : {args.topic}")
     print(f"Partition : {args.partition}")
     print(f"Broker    : {args.host}:{args.port}")
-    print(f"Messages  : {high_watermark}   (offsets 0..{max(high_watermark - 1, 0)})")
+    print(f"Offsets   : earliest={earliest}  latest={latest}  ({count} messages)")
     print(f"Log file  : {log_path}")
     print(f"Log size  : {size:,} bytes"
-          + (f"   (~{size // high_watermark} bytes/message)" if high_watermark else ""))
+          + (f"   (~{size // count} bytes/message)" if count else ""))
 
-    if high_watermark == 0:
-        print("\nNote: this partition is empty. Because auto-creation is on, a "
-              "\n      typo'd topic name looks exactly like this. Check the spelling.")
+    if earliest > 0:
+        print(f"\nNote: earliest offset is {earliest}, not 0 — retention has "
+              f"\n      deleted older data. A consumer below {earliest} gets "
+              f"OFFSET_OUT_OF_RANGE.")
     return 0
 
 
 def cmd_tail(args) -> int:
     """Show the most recent messages, like `tail -n`."""
-    high_watermark = _fetch(args, 0, 1).get('high_watermark', 0)
-    if high_watermark == 0:
+    latest = _request(args, API_LIST_OFFSETS, {
+        'topic': args.topic, 'partition': args.partition,
+        'timestamp': TIMESTAMP_LATEST})['offset']
+
+    if latest == 0:
         print(f"{args.topic}-{args.partition} is empty.")
         return 0
 
+    high_watermark = latest
     start = max(0, high_watermark - args.count)
     messages = _fetch(args, start, args.count).get('messages', [])
 
@@ -187,6 +248,10 @@ def main() -> int:
 
     sub = parser.add_subparsers(dest='command', required=True)
 
+    p = sub.add_parser('metadata', help='cluster + topic overview (asks the broker)')
+    p.add_argument('--topic', default=None, help='limit to one topic')
+    p.set_defaults(func=cmd_metadata)
+
     p = sub.add_parser('describe', help='partition summary (asks the broker)')
     p.add_argument('--topic', required=True)
     p.add_argument('--partition', type=int, default=0)
@@ -215,6 +280,12 @@ def main() -> int:
         print(f"Cannot reach the broker at {args.host}:{args.port}: {exc}",
               file=sys.stderr)
         print("Is it running?  python -m broker.broker", file=sys.stderr)
+        return 1
+    except KafkaError as exc:
+        # The broker answered and said no. Report it as a plain message rather
+        # than a traceback: a CLI user asked a question and got an answer, and
+        # a stack trace would imply the tool malfunctioned.
+        print(f"{exc}", file=sys.stderr)
         return 1
 
 

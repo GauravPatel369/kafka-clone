@@ -47,7 +47,7 @@ import time
 
 from broker.broker import Broker
 from common.net import SyncConnection
-from common.protocol import MSG_FETCH, MSG_PRODUCE
+from common.protocol import API_FETCH, API_METADATA, API_PRODUCE
 
 
 def percentile(sorted_values: list, fraction: float) -> float:
@@ -97,7 +97,7 @@ def bench_produce(port: int, topic: str, count: int, value: str) -> tuple:
         # opening, and Python's import/JIT-ish warm-up costs. Including it
         # would put a huge outlier in the max column that says nothing about
         # steady-state behaviour.
-        conn.request(MSG_PRODUCE, payload)
+        conn.request(API_PRODUCE, payload)
 
         started = time.perf_counter()
         for _ in range(count):
@@ -106,11 +106,95 @@ def bench_produce(port: int, topic: str, count: int, value: str) -> tuple:
             # resolution. Using time.time() for durations is a classic way to
             # record a negative latency at 2am.
             t0 = time.perf_counter()
-            conn.request(MSG_PRODUCE, payload)
+            conn.request(API_PRODUCE, payload)
             latencies.append((time.perf_counter() - t0) * 1000)
         elapsed = time.perf_counter() - started
 
     return elapsed, latencies
+
+
+def bench_produce_pipelined(port: int, topic: str, count: int, value: str,
+                            depth: int) -> tuple:
+    """
+    Send `count` messages with up to `depth` requests in flight at once.
+
+    Identical work, identical protocol, identical broker — the only difference
+    is that the client stops waiting for each acknowledgement before sending
+    the next request. That is possible solely because the header now carries a
+    correlation_id to match replies by.
+
+    Latency is measured per BATCH, not per message: with `depth` requests in
+    flight there is no meaningful per-message round trip to time. Compare the
+    throughput column, not the latency column.
+
+    Depth is bounded deliberately. Sending unboundedly many requests before
+    reading any reply deadlocks once both socket buffers fill — we block
+    writing while the broker blocks writing replies nobody is draining. Real
+    clients cap this with `max.in.flight.requests.per.connection`.
+    """
+    latencies = []
+    with SyncConnection('127.0.0.1', port, timeout=30.0) as conn:
+        payload = {'topic': topic, 'partition': 0, 'value': value, 'key': None}
+        conn.request(API_PRODUCE, payload)          # warm-up
+
+        started = time.perf_counter()
+        remaining = count
+        while remaining > 0:
+            batch = min(depth, remaining)
+            t0 = time.perf_counter()
+            conn.pipeline([(API_PRODUCE, payload)] * batch)
+            latencies.append((time.perf_counter() - t0) * 1000)
+            remaining -= batch
+        elapsed = time.perf_counter() - started
+
+    return elapsed, latencies
+
+
+def bench_roundtrip(port: int, count: int, depth: int) -> tuple:
+    """
+    Time the cheapest possible request, sequentially and pipelined.
+
+    WHY THIS MEASUREMENT EXISTS
+      Comparing sequential and pipelined PRODUCE alone cannot tell you *why*
+      the numbers came out as they did, because a PRODUCE mixes two very
+      different costs: the network round trip (which pipelining removes) and
+      the broker's own work — a thread hop to the executor, a file write, a
+      flush (which pipelining cannot touch, since the broker handles one
+      request per connection at a time).
+
+      METADATA on an empty registry does no disk I/O and no thread hop, so its
+      per-request cost is protocol overhead plus the round trip and nothing
+      else. Subtracting the pipelined time from the sequential time isolates
+      the WAIT — which is the difference between a benchmark that reports a
+      number and one that explains it.
+
+    MUST RUN FIRST, on an empty broker. Once topics exist, the METADATA
+    response grows and gets more variable, and the subtraction — a difference
+    of two similar numbers — drowns in that noise. (It measured *negative* on
+    the first attempt for exactly this reason.) Differences of similar
+    quantities are always the fragile part of a measurement; give them the
+    quietest conditions you can.
+
+    Returns (per_request_sequential_us, per_request_pipelined_us).
+    """
+    with SyncConnection('127.0.0.1', port, timeout=30.0) as conn:
+        for _ in range(20):
+            conn.request(API_METADATA, {})          # warm-up
+
+        started = time.perf_counter()
+        for _ in range(count):
+            conn.request(API_METADATA, {})
+        sequential = time.perf_counter() - started
+
+        started = time.perf_counter()
+        remaining = count
+        while remaining > 0:
+            batch = min(depth, remaining)
+            conn.pipeline([(API_METADATA, {})] * batch)
+            remaining -= batch
+        pipelined = time.perf_counter() - started
+
+    return sequential / count * 1e6, pipelined / count * 1e6
 
 
 def bench_consume(port: int, topic: str, count: int, batch: int) -> tuple:
@@ -123,7 +207,7 @@ def bench_consume(port: int, topic: str, count: int, batch: int) -> tuple:
         started = time.perf_counter()
         while received < count:
             t0 = time.perf_counter()
-            response = conn.request(MSG_FETCH, {
+            response = conn.request(API_FETCH, {
                 'topic': topic, 'partition': 0, 'offset': offset, 'max': batch,
             })
             latencies.append((time.perf_counter() - t0) * 1000)
@@ -147,6 +231,8 @@ def main() -> None:
                         help='Message payload size in bytes')
     parser.add_argument('--batch', type=int, default=100,
                         help='Messages per fetch request')
+    parser.add_argument('--pipeline-depth', type=int, default=100,
+                        help='Requests in flight at once for the pipelined run')
     parser.add_argument('--data-dir', default=None,
                         help='Defaults to a fresh temp directory')
     args = parser.parse_args()
@@ -176,9 +262,39 @@ def main() -> None:
     print(f"  fetch size: {args.batch} messages/request")
 
     try:
+        # FIRST, while the broker is still empty — see bench_roundtrip.
+        cheap_us, cheap_pipe_us = bench_roundtrip(
+            broker.port, args.count, args.pipeline_depth)
+        rtt_us = cheap_us - cheap_pipe_us
+
         p_elapsed, p_latencies = bench_produce(broker.port, topic, args.count, value)
-        print(format_row('PRODUCE (one round trip per message)',
+        print(format_row('PRODUCE sequential (one round trip per message)',
                          args.count, p_elapsed, args.size, summarise(p_latencies)))
+
+        pipe_topic = topic + '-pipelined'
+        q_elapsed, q_latencies = bench_produce_pipelined(
+            broker.port, pipe_topic, args.count, value, args.pipeline_depth)
+        print(format_row(
+            f'PRODUCE pipelined ({args.pipeline_depth} requests in flight)',
+            args.count, q_elapsed, args.size, summarise(q_latencies)))
+
+        speedup = (p_elapsed / q_elapsed) if q_elapsed else 0
+        print(f"\n    → pipelining is {speedup:.2f}x on identical work")
+
+        produce_us = p_elapsed / args.count * 1e6
+        work_us = max(produce_us - rtt_us, 1.0)
+
+        print(f"\n  COST BREAKDOWN (per request, microseconds)")
+        print(f"    cheap request (METADATA), sequential : {cheap_us:7.1f}")
+        print(f"    same request, pipelined              : {cheap_pipe_us:7.1f}")
+        print(f"    → loopback round-trip wait           : {rtt_us:7.1f}"
+              f"   ← what pipelining removes")
+        print(f"    PRODUCE, sequential                  : {produce_us:7.1f}")
+        print(f"    → broker work (thread hop + disk)    : {work_us:7.1f}"
+              f"   ← what pipelining CANNOT remove")
+        if rtt_us <= 0:
+            print("    (round trip measured at or below the noise floor — "
+                  "rerun on an idle machine)")
 
         c_elapsed, c_latencies, received = bench_consume(
             broker.port, topic, args.count, args.batch)
@@ -188,16 +304,54 @@ def main() -> None:
         broker.stop()
         thread.join(timeout=5)
 
-    print("""
+    # Projections from the numbers just measured. Loopback is the WORST case
+    # for pipelining, so extrapolating is the only way to see what it is for.
+    def projected(rtt_ms):
+        rtt = rtt_ms * 1000
+        return (1e6 / (work_us + rtt), 1e6 / work_us)
+
+    print(f"""
   Reading these numbers
   ---------------------
-  Produce is one full network round trip per message, so its throughput is
-  capped by latency, not by the broker. Consume fetches many messages per
-  round trip, which is why it looks so much faster -- that difference IS the
-  argument for the producer batching arriving in Phase 3.
+  Pipelining came out at {speedup:.2f}x, and that is the honest result: on
+  LOOPBACK it barely helps. It is worth understanding exactly why, because
+  the reason is more useful than the number.
 
-  Watch consume latency as the log grows: `fetch` scans the file from byte
-  zero every time, so it gets steadily worse with more data. Phase 2's
+  Pipelining removes the time a client spends WAITING for a reply. The cost
+  breakdown above shows that on loopback the wait is only ~{rtt_us:.0f} us,
+  while a PRODUCE costs ~{produce_us:.0f} us -- the other ~{work_us:.0f} us is
+  the broker actually working: a thread hop to the executor, a file write, a
+  flush. The broker is NOT idle during a produce, so there is little idle time
+  to reclaim.
+
+  A second reason: our broker handles one request per connection at a time
+  (read, route, reply, repeat). Pipelined requests therefore queue up and are
+  still processed serially. Pipelining removes the CLIENT's waiting, not the
+  BROKER's serialisation. Real Kafka behaves the same way per connection --
+  that in-order handling is exactly what makes its ordering guarantee work.
+
+  So when IS it worth four bytes of header? When the round trip dominates the
+  work -- which is every real network. Using the ~{work_us:.0f} us of broker
+  work measured above:
+
+      round trip     sequential      pipelined     speedup
+      ----------     ----------      ---------     -------""")
+    for rtt_ms, label in ((0.035, 'loopback'), (0.5, 'same LAN'),
+                          (5.0, 'same region'), (50.0, 'cross-region')):
+        seq, pipe = projected(rtt_ms)
+        print(f"      {rtt_ms:6.3f} ms     {seq:9,.0f}/s    {pipe:9,.0f}/s"
+              f"     {pipe / seq:6.1f}x   ({label})")
+
+    print("""
+  That is the mechanism the correlation_id bought. It is invisible here and
+  decisive at 50 ms.
+
+  The real fix for produce throughput is BATCHING -- many messages inside ONE
+  request -- which cuts the per-message broker work as well as the waiting.
+  That is Phase 3, and it is the row that will move this benchmark.
+
+  Watch consume latency as the log grows: `fetch` still scans the file from
+  byte zero every time, so it gets steadily worse with more data. Phase 2's
   segments and index are what flatten that curve.
 
   Record this run in docs/benchmarks.md.""")
