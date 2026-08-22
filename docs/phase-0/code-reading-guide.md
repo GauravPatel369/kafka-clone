@@ -3,7 +3,7 @@
 > **A note on the numbering, because it collides.**
 >
 > The original prototype's docstrings called themselves "Phase 1" and promised
-> things in "Phase 2". The roadmap in [00-overview.md](00-overview.md) uses a
+> things in "Phase 2". The roadmap in [00-overview.md](../00-overview.md) uses a
 > different numbering, where Phase 1 is *Protocol v2* — which is not built yet.
 >
 > This document is about **the code that exists right now**: the single-broker
@@ -48,13 +48,13 @@ explanation.
 
 | # | File | Lines | Read it for |
 |---|---|---|---|
-| 1 | [common/protocol.py](../common/protocol.py) | 74 | The contract. Nothing else makes sense first. |
-| 2 | [broker/partition.py](../broker/partition.py) | 351 | The append-only log. **The single most important file.** |
-| 3 | [broker/broker.py](../broker/broker.py) | 366 | How bytes become `partition.append()` calls |
-| 4 | [common/net.py](../common/net.py) | 306 | The client side of the same conversation |
-| 5 | [producer/producer.py](../producer/producer.py) | 186 | The write client — thin on purpose |
-| 6 | [consumer/consumer.py](../consumer/consumer.py) | 378 | The read client. **Where the hard trade-offs live.** |
-| 7 | [common/config.py](../common/config.py) | 49 | Defaults, and why each was chosen |
+| 1 | [common/protocol.py](../../common/protocol.py) | 74 | The contract. Nothing else makes sense first. |
+| 2 | [broker/partition.py](../../broker/partition.py) | 351 | The append-only log. **The single most important file.** |
+| 3 | [broker/broker.py](../../broker/broker.py) | 366 | How bytes become `partition.append()` calls |
+| 4 | [common/net.py](../../common/net.py) | 306 | The client side of the same conversation |
+| 5 | [producer/producer.py](../../producer/producer.py) | 186 | The write client — thin on purpose |
+| 6 | [consumer/consumer.py](../../consumer/consumer.py) | 378 | The read client. **Where the hard trade-offs live.** |
+| 7 | [common/config.py](../../common/config.py) | 49 | Defaults, and why each was chosen |
 
 If you only read two: `partition.py` and `consumer.py`. The first is the idea
 Kafka is built on; the second is where you have to make a choice that cannot
@@ -74,7 +74,7 @@ snippet in §5.
 producer.send("hello")        # topic='orders'
 ```
 
-### Step 1 — build the payload · [producer.py:100](../producer/producer.py#L100)
+### Step 1 — build the payload · [producer.py:100](../../producer/producer.py#L100)
 
 A plain dict. Nothing is encoded yet.
 
@@ -85,7 +85,7 @@ A plain dict. Nothing is encoded yet.
 The `partition: 0` is hardcoded today, and that hardcoding *is* the reason
 there is no load balancing yet. Phase 3 replaces it with a partitioner.
 
-### Step 2 — frame it · [protocol.py:42](../common/protocol.py#L42)
+### Step 2 — frame it · [protocol.py:42](../../common/protocol.py#L42)
 
 `encode_message` does two things: `json.dumps` the payload, then prepend a
 12-byte header.
@@ -110,13 +110,13 @@ Three things to notice:
   That is the price of a readable format and one round trip per message, and
   it is what Phase 3's batching amortises away.
 
-### Step 3 — send · [net.py:215](../common/net.py#L215)
+### Step 3 — send · [net.py:215](../../common/net.py#L215)
 
 `sendall`, not `send`. `send()` returns how many bytes it *actually* queued,
 which under load is fewer than you gave it. Using `send()` and ignoring the
 return value is a bug that only appears when the system is busy.
 
-### Step 4 — the broker reads the header · [broker.py:214](../broker/broker.py#L214)
+### Step 4 — the broker reads the header · [broker.py:214](../../broker/broker.py#L214)
 
 ```python
 header_bytes = await reader.readexactly(HEADER_SIZE)     # blocks until 12 bytes
@@ -126,14 +126,14 @@ body_bytes = await reader.readexactly(body_length)        # then exactly 66
 ```
 
 The same two-step dance as the client, in asyncio form. `readexactly` is
-asyncio's version of the loop at [net.py:262](../common/net.py#L262) — both
+asyncio's version of the loop at [net.py:262](../../common/net.py#L262) — both
 exist because `recv(n)` is a *maximum*, not a promise.
 
-### Step 5 — route · [broker.py:137](../broker/broker.py#L137)
+### Step 5 — route · [broker.py:137](../../broker/broker.py#L137)
 
 `msg_type == 1` → `MSG_PRODUCE` → get the partition, append.
 
-### Step 6 — cross the thread boundary · [broker.py:156](../broker/broker.py#L156)
+### Step 6 — cross the thread boundary · [broker.py:156](../../broker/broker.py#L156)
 
 ```python
 offset = await asyncio.get_running_loop().run_in_executor(
@@ -149,7 +149,7 @@ loop — every other connected client stops while this one disk write happens.
 It is also the reason the next step needs a lock: the executor is a *pool*, so
 two appends genuinely can run at the same instant.
 
-### Step 7 — append · [partition.py:140](../broker/partition.py#L140)
+### Step 7 — append · [partition.py:140](../../broker/partition.py#L140)
 
 ```python
 with self._lock:                        # ← one writer at a time
@@ -179,7 +179,7 @@ thread B writes record 41, sets next_offset = 42
 Two messages now claim offset 41, and offset 42 never exists. Every guarantee
 in Kafka — ordering, replay, deduplication, replication — is built on *an
 offset names exactly one message*. That lock is what makes it true.
-[test_partition.py](../tests/test_partition.py) proves it with 8 threads.
+[test_partition.py](../../tests/test_partition.py) proves it with 8 threads.
 
 **And sit with `flush()` too.** It pushes data to the OS page cache, not to
 the physical disk. Kill the broker process: nothing is lost. Pull the power
@@ -218,11 +218,11 @@ producer.send("hello")
 
 | Step | Location | What happens |
 |---|---|---|
-| 1 | [consumer.py:144](../consumer/consumer.py#L144) | Send `{'topic', 'partition', 'offset': position, 'max'}` |
-| 2 | [broker.py:166](../broker/broker.py#L166) | Route to `MSG_FETCH` |
-| 3 | [broker.py:174](../broker/broker.py#L174) | `run_in_executor(partition.fetch, ...)` |
-| 4 | [partition.py:196](../broker/partition.py#L196) | **Scan the log from byte zero** |
-| 5 | [consumer.py:169](../consumer/consumer.py#L169) | Advance `position` — and commit *nothing* |
+| 1 | [consumer.py:144](../../consumer/consumer.py#L144) | Send `{'topic', 'partition', 'offset': position, 'max'}` |
+| 2 | [broker.py:166](../../broker/broker.py#L166) | Route to `MSG_FETCH` |
+| 3 | [broker.py:174](../../broker/broker.py#L174) | `run_in_executor(partition.fetch, ...)` |
+| 4 | [partition.py:196](../../broker/partition.py#L196) | **Scan the log from byte zero** |
+| 5 | [consumer.py:169](../../consumer/consumer.py#L169) | Advance `position` — and commit *nothing* |
 
 ### Look hard at step 4
 
@@ -248,7 +248,7 @@ fetch #50 (offset 4900)   13.8 ms      ← max
 A broker that gets slower the longer it runs is not a broker you can operate.
 At a million messages one fetch takes seconds. **This is the single biggest
 flaw in the current design**, and Phase 2 (segments + sparse index) exists to
-fix it. See [benchmarks.md](benchmarks.md).
+fix it. See [benchmarks.md](../benchmarks.md).
 
 ### And look hard at step 5
 
@@ -258,7 +258,7 @@ self.position = messages[-1]['offset'] + 1     # in memory
 ```
 
 `poll()` advances an in-memory cursor and writes nothing to disk. `commit()`
-is a separate call at [consumer.py:192](../consumer/consumer.py#L192).
+is a separate call at [consumer.py:192](../../consumer/consumer.py#L192).
 
 That separation *is* the delivery guarantee. Where you call `commit()` decides
 whether a crash loses messages or repeats them, and there is no third option:
@@ -285,22 +285,22 @@ reprocessed in the other.
 
 | Concept | File · function |
 |---|---|
-| Wire format | [protocol.py:42](../common/protocol.py#L42) `encode_message` |
-| Message framing (client) | [net.py:262](../common/net.py#L262) `_recv_exactly` |
-| Message framing (broker) | [broker.py:214](../broker/broker.py#L214) `readexactly` |
-| **Offset assignment** | [partition.py:140](../broker/partition.py#L140) `append` |
-| Append-only write | [partition.py:140](../broker/partition.py#L140) `append` |
-| Read path (the O(n) one) | [partition.py:196](../broker/partition.py#L196) `fetch` |
-| Crash recovery | [partition.py:255](../broker/partition.py#L255) `_recover_offset` |
-| Topic auto-creation | [broker.py:101](../broker/broker.py#L101) `_get_partition` |
-| Request routing | [broker.py:130](../broker/broker.py#L130) `_route` |
-| Concurrency (one client) | [broker.py:195](../broker/broker.py#L195) `handle_client` |
-| Blocking-I/O escape hatch | [broker.py:156](../broker/broker.py#L156) `run_in_executor` |
-| Consumer position | [consumer.py:144](../consumer/consumer.py#L144) `poll` |
-| **Delivery semantics** | [consumer.py:192](../consumer/consumer.py#L192) `commit` |
-| Atomic offset write | [consumer.py:285](../consumer/consumer.py#L285) `_save_offset` |
-| Replay | [consumer.py:206](../consumer/consumer.py#L206) `seek` |
-| Consumer lag | [consumer.py:179](../consumer/consumer.py#L179) `lag` |
+| Wire format | [protocol.py:42](../../common/protocol.py#L42) `encode_message` |
+| Message framing (client) | [net.py:262](../../common/net.py#L262) `_recv_exactly` |
+| Message framing (broker) | [broker.py:214](../../broker/broker.py#L214) `readexactly` |
+| **Offset assignment** | [partition.py:140](../../broker/partition.py#L140) `append` |
+| Append-only write | [partition.py:140](../../broker/partition.py#L140) `append` |
+| Read path (the O(n) one) | [partition.py:196](../../broker/partition.py#L196) `fetch` |
+| Crash recovery | [partition.py:255](../../broker/partition.py#L255) `_recover_offset` |
+| Topic auto-creation | [broker.py:101](../../broker/broker.py#L101) `_get_partition` |
+| Request routing | [broker.py:130](../../broker/broker.py#L130) `_route` |
+| Concurrency (one client) | [broker.py:195](../../broker/broker.py#L195) `handle_client` |
+| Blocking-I/O escape hatch | [broker.py:156](../../broker/broker.py#L156) `run_in_executor` |
+| Consumer position | [consumer.py:144](../../consumer/consumer.py#L144) `poll` |
+| **Delivery semantics** | [consumer.py:192](../../consumer/consumer.py#L192) `commit` |
+| Atomic offset write | [consumer.py:285](../../consumer/consumer.py#L285) `_save_offset` |
+| Replay | [consumer.py:206](../../consumer/consumer.py#L206) `seek` |
+| Consumer lag | [consumer.py:179](../../consumer/consumer.py#L179) `lag` |
 
 ### And where isn't it yet?
 
@@ -390,7 +390,7 @@ expensive. Kafka's broker remembers *nothing* about you, which is why one
 broker handles what would take a cluster of queue servers.
 
 **"Why is there a lock inside an asyncio program?"**
-Because [broker.py:156](../broker/broker.py#L156) hands file I/O to a *thread
+Because [broker.py:156](../../broker/broker.py#L156) hands file I/O to a *thread
 pool*. The event loop is single-threaded; the executor is not. Any state the
 executor touches needs real locking.
 
@@ -423,15 +423,15 @@ meaning "everything *replicated*", which is a much more interesting number.
 
 ## 7. Then read the tests
 
-[tests/](../tests/) is the executable version of this document. Each test
+[tests/](../../tests/) is the executable version of this document. Each test
 names a property the system must have, and most name why:
 
-- [test_partition.py](../tests/test_partition.py) — `test_concurrent_appends_never_duplicate_an_offset`
+- [test_partition.py](../../tests/test_partition.py) — `test_concurrent_appends_never_duplicate_an_offset`
   is the one to read first. Delete the lock in `append` and watch it fail.
-- [test_end_to_end.py](../tests/test_end_to_end.py) — `test_poll_does_not_commit`
+- [test_end_to_end.py](../../tests/test_end_to_end.py) — `test_poll_does_not_commit`
   and `test_at_least_once_redelivers_when_processing_fails` pin down the
   delivery semantics.
-- [test_protocol.py](../tests/test_protocol.py) — `test_magic_is_big_endian_on_the_wire`
+- [test_protocol.py](../../tests/test_protocol.py) — `test_magic_is_big_endian_on_the_wire`
   exists to stop someone "simplifying" the `!` out of the struct format.
 
 A good way to finish: pick a test, break the code it covers, and confirm it
@@ -444,11 +444,11 @@ finding out which is the actual learning.
 
 ## Where to go from here
 
-- [00-overview.md](00-overview.md) — the concepts, if you read the code first
+- [00-overview.md](../00-overview.md) — the concepts, if you read the code first
   and want the theory second
 - [phase-0-foundation.md](phase-0-foundation.md) — the four bugs this code
   used to have, and why each fix is the way it is
-- [benchmarks.md](benchmarks.md) — the numbers behind §3's flaw
+- [benchmarks.md](../benchmarks.md) — the numbers behind §3's flaw
 
 Phase 1 (Protocol v2) is next to be built: correlation IDs, API keys and
 versions, and numeric error codes — which between them fix the

@@ -262,7 +262,7 @@ matches our assumptions.
 
 Reports produce and consume throughput (msgs/sec, MB/sec) and latency
 percentiles (p50/p95/p99). Every phase appends a row to
-[`benchmarks.md`](benchmarks.md).
+[`benchmarks.md`](../benchmarks.md).
 
 **Why percentiles and not an average:** an average hides the tail. A system that
 answers in 1 ms 99 times and 2000 ms once has a 21 ms average — which describes
@@ -392,7 +392,7 @@ python -m consumer.consumer --group demo   # terminal 3
 python -m tools.kfk describe --topic orders
 ```
 
-Record the benchmark row in [`benchmarks.md`](benchmarks.md). That is the
+Record the benchmark row in [`benchmarks.md`](../benchmarks.md). That is the
 number every later phase is compared against.
 
 → Next: **Phase 1 — Protocol v2** (correlation IDs, API keys, real error codes).

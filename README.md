@@ -22,12 +22,16 @@ Two ways in, depending on how you like to learn:
 - **Concepts first** → **[docs/00-overview.md](docs/00-overview.md)**
   What pub-sub solves, why Kafka is a log rather than a queue, and the six
   words you need.
-- **Code first** → **[docs/code-reading-guide.md](docs/code-reading-guide.md)**
+- **Code first** → **[docs/phase-0/code-reading-guide.md](docs/phase-0/code-reading-guide.md)**
   Which file to open in what order, one message traced byte by byte from
   `send()` to disk, a concept→file→function map, and five things to run
   yourself.
 
 Then follow the phases in order. Each has its own doc.
+
+Preparing to be asked about this? **[docs/interview-questions.md](docs/interview-questions.md)**
+maps every concept here to the questions it gets asked as, with the measured
+numbers from this repo to answer them with.
 
 ---
 
@@ -85,15 +89,20 @@ and get reprocessed in the other.
     written atomically)                           one file per partition)
 ```
 
-Wire format — a fixed 12-byte header so the reader always knows how much to
+Wire format — a fixed 16-byte header so the reader always knows how much to
 read next, then a JSON body:
 
 ```
-┌────────────┬────────────┬────────────┬──────────────────┐
-│  magic 4B  │ length 4B  │  type 4B   │   body (JSON)    │
-│   0xCAFE   │            │            │                  │
-└────────────┴────────────┴────────────┴──────────────────┘
+┌──────────┬───────────┬─────────┬─────────┬────────────────┬───────────┐
+│ magic 4B │ length 4B │ api_key │ api_ver │ correlation_id │ body JSON │
+│  0xCAFE  │  of body  │   2B    │   2B    │      4B        │           │
+└──────────┴───────────┴─────────┴─────────┴────────────────┴───────────┘
 ```
+
+`correlation_id` lets a client have many requests in flight and match the
+replies; `api_version` is what makes a rolling upgrade possible. Every
+response carries a numeric `error_code`, classified retriable or not, so
+clients decide what to retry without parsing English.
 
 ---
 
@@ -101,9 +110,9 @@ read next, then a JSON body:
 
 | Phase | Title | Adds | Status |
 |---|---|---|---|
-| **0** | [Foundation](docs/phase-0-foundation.md) | Tests, benchmarks, chaos scripts, admin CLI; four bug fixes | ✅ done |
-| 1 | Protocol v2 | Correlation IDs, API keys + versions, numeric error codes | next |
-| 2 | Storage engine | Segments, sparse index, CRC32, retention, flush policy | |
+| **0** | [Foundation](docs/phase-0/phase-0-foundation.md) | Tests, benchmarks, chaos scripts, admin CLI; four bug fixes | ✅ done |
+| **1** | [Protocol v2](docs/phase-1/phase-1-protocol.md) | Correlation IDs, API keys + versions, numeric error codes, `LIST_OFFSETS`, `METADATA` | ✅ done |
+| 2 | Storage engine | Segments, sparse index, CRC32, retention, flush policy | next |
 | 3 | Partitioning | Key hashing, batching, `acks`, retries — **load balancing** | |
 | 4 | Consumer groups | Coordinator, rebalance, server-side offsets, delivery semantics | |
 | 5 | Cluster | Multi-broker, membership, controller election, metadata routing | |
@@ -139,7 +148,11 @@ tools/      kfk.py        admin CLI
 tests/      conftest.py   real broker on an ephemeral port
 bench/      bench.py      throughput + latency percentiles
 chaos/                    scripts that break things on purpose
-docs/                     one file per phase, plus benchmarks
+docs/       00-overview.md          concepts, before any code
+            benchmarks.md           one row per phase
+            interview-questions.md  concepts → questions, with our numbers
+            phase-0/                foundation + code reading guide
+            phase-1/                protocol v2
 ```
 
 ---
@@ -161,10 +174,11 @@ pitch:
   offset file; the broker knows nothing about groups. Phase 4.
 - **Offsets are local files.** Move a consumer to another machine and it
   starts over. Phase 4.
-- **No error codes.** Failures are strings in a JSON field, so clients cannot
-  decide programmatically what to retry. Phase 1.
-- **One request in flight per connection.** No pipelining until the protocol
-  carries a correlation ID. Phase 1.
+- **No producer batching.** One message per request, so ~215 µs of broker work
+  is paid per message. This — not the network — is what caps produce
+  throughput. Phase 3.
+- **No version negotiation.** Everything is `api_version=0`; there is no
+  `ApiVersions` request, so a client cannot ask what a broker supports.
 
 ---
 

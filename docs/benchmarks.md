@@ -17,7 +17,7 @@ worse than no benchmark, because it feels like evidence.
 | Phase | Produce (msg/s) | Produce p99 (ms) | Consume (msg/s) | Consume p99 (ms) | What changed |
 |---|---:|---:|---:|---:|---|
 | **0 — Foundation** | 3,982 | 0.55 | 17,081 | 13.81 | Baseline. One round trip per message; O(n) log scan per fetch. |
-| 1 — Protocol v2 | | | | | Correlation IDs, API keys, error codes |
+| **1 — Protocol v2** | 3,946 | 0.50 | 17,007 | 12.12 | Correlation IDs, API versions, error codes. Header 12→16 bytes. **No throughput change, as expected** — see below. |
 | 2 — Storage engine | | | | | Segments + sparse index → fetch should stop degrading |
 | 3 — Partitioning | | | | | Batching + `linger.ms` → produce should jump ~10-50x |
 | 4 — Consumer groups | | | | | Server-side offsets; expect a small commit cost |
@@ -87,6 +87,78 @@ result to check, more than the throughput number.**
 
 ---
 
+## Phase 1: the result that contradicted the plan
+
+Phase 1 added correlation IDs specifically so a client could stop waiting for
+each acknowledgement — pipelining. The prediction, written into
+[phase-1-protocol.md](phase-1/phase-1-protocol.md) before the code, was a large
+throughput win.
+
+The measurement:
+
+```
+PRODUCE sequential                     3,946 msg/sec
+PRODUCE pipelined (100 in flight)      4,143 msg/sec     → 1.05x
+```
+
+**Essentially nothing.** The prediction was wrong, and the reason is worth
+more than the win would have been. The benchmark now measures the cost
+breakdown that explains it:
+
+| Per request | µs |
+|---|---:|
+| Cheap request (METADATA), sequential | 130.1 |
+| Same request, pipelined | 91.9 |
+| **→ loopback round-trip wait** | **38.2** ← what pipelining removes |
+| PRODUCE, sequential | 253.4 |
+| **→ broker work (thread hop + disk)** | **215.2** ← what pipelining cannot remove |
+
+Pipelining removes *waiting*. On loopback the wait is 38 µs of a 253 µs
+request; the other 215 µs is the broker genuinely working. The broker was
+never idle, so there was no idle time to reclaim. (Phase 0's commentary here
+claimed the broker "sits idle most of that time" — that was an assumption, and
+this measurement disproves it.)
+
+Second limit: the broker serves one request per connection at a time, so
+pipelined requests queue and are still handled serially. Pipelining removes
+the *client's* waiting, not the *broker's* serialisation.
+
+So when does the header change pay off? When round trip dominates work.
+Projected from the measured 215 µs:
+
+| Round trip | Sequential | Pipelined | Speedup |
+|---|---:|---:|---:|
+| 0.035 ms (loopback) | 3,345/s | 3,788/s | 1.1x |
+| 0.5 ms (same LAN) | 1,309/s | 3,788/s | **2.9x** |
+| 5 ms (same region) | 190/s | 3,788/s | **19.9x** |
+| 50 ms (cross-region) | 20/s | 3,788/s | **190.4x** |
+
+**Latency-hiding optimisations have no measurable value on localhost.** Their
+benefit is a property of the network, so benchmarking them on loopback tests
+the single environment where they cannot help. Benchmark only locally and you
+will conclude they are pointless — then ship something that collapses at 50 ms.
+
+The corollary for Phase 3: pipelining is not what fixes produce throughput
+here. The 215 µs of per-message broker work is. Only batching — many messages
+inside one request — cuts that.
+
+### A measurement bug worth recording
+
+The first attempt computed the round trip *after* the produce runs, and got
+**−4.7 µs**. A negative wait is obviously impossible, which is what made it
+easy to catch.
+
+Cause: the estimate is a difference of two similar numbers (sequential minus
+pipelined METADATA), and by then the broker held several topics, so METADATA
+responses were larger and noisier than the difference being measured. Moving
+that measurement to the start, on an empty broker, gave a stable 38 µs.
+
+Differences of similar quantities are the fragile part of any measurement.
+Give them the quietest conditions available, and treat an impossible result as
+a bug in the instrument rather than a discovery.
+
+---
+
 ## How to read these numbers honestly
 
 **Loopback is not a network.** Client and broker share a machine, so the
@@ -106,7 +178,7 @@ system worse. Watch p99.
 to disk. Adding `os.fsync` would cut produce throughput by 10–100x. That
 number is not a flaw in the benchmark — it is the reason Kafka buys durability
 with replication (Phase 6) rather than with fsync. Try it: Exercise 3 in
-[phase-0-foundation.md](phase-0-foundation.md).
+[phase-0-foundation.md](phase-0/phase-0-foundation.md).
 
 **Same machine, same conditions, or don't compare.** Numbers from different
 hardware are not comparable. Rerun Phase 0's baseline on your machine before

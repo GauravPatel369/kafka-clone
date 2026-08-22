@@ -200,7 +200,7 @@ end of any phase and run it. Each phase has a doc in `docs/` with the same shape
 
 | Phase | Title | What it adds |
 |---|---|---|
-| [0](phase-0-foundation.md) | Foundation | Test harness, benchmarks, chaos scripts, admin CLI, and four bug fixes to the prototype |
+| [0](phase-0/phase-0-foundation.md) | Foundation | Test harness, benchmarks, chaos scripts, admin CLI, and four bug fixes to the prototype |
 | 1 | Protocol v2 | Correlation IDs, API keys/versions, real error codes |
 | 2 | Storage engine | Segments, sparse index, CRC, retention, flush policy |
 | 3 | Partitioning | Key hashing, batching, `acks`, producer retries — *load balancing* |
@@ -226,9 +226,9 @@ anything. Phase 0 fixes that foundation before we build on it — because a bug 
 the storage layer becomes a bug in the replication layer, and by then it is much
 harder to see.
 
-→ Continue to [Phase 0 — Foundation](phase-0-foundation.md).
+→ Continue to [Phase 0 — Foundation](phase-0/phase-0-foundation.md).
 
 If you would rather see the working system before reading about how it got
-that way, [the code reading guide](code-reading-guide.md) walks the current
+that way, [the code reading guide](phase-0/code-reading-guide.md) walks the current
 codebase file by file and traces one message from `send()` all the way to
 disk.
