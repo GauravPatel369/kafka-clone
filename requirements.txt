@@ -1,0 +1,9 @@
+# The runtime of this project is deliberately stdlib-only.
+#
+# Using a message-queue library would hide the exact mechanism we are trying
+# to understand, so the broker, protocol, storage, replication and client code
+# are all hand-written against `socket`, `asyncio`, `struct`, `json` and `os`.
+#
+# pytest is the single development dependency.
+
+pytest>=7.0

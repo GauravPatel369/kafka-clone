@@ -28,3 +28,12 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Packaging artifacts (from `pip install -e .`)
+build/
+dist/
+*.egg-info/
+
+# Scratch output from running a broker in the background
+broker.out
+broker.err

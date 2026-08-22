@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kafka-clone"
+version = "0.1.0"
+description = "A distributed publish-subscribe messaging system, built phase by phase to learn how Kafka works"
+requires-python = ">=3.9"
+dependencies = []          # runtime is stdlib-only, on purpose
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["common", "broker", "producer", "consumer", "tools", "bench", "chaos"]
+
+[tool.pytest.ini_options]
+# pythonpath = ["."] lets `import common.protocol` work in tests without
+# installing the project and without any sys.path hacks in the source files.
+# It is the pytest equivalent of running everything with `python -m` from root.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: takes more than a second; deselect with -m 'not slow'",
+]
