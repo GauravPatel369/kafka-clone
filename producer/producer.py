@@ -1,175 +1,186 @@
 """
-CONCEPT: The Producer — TCP Client (Write Side)
--------------------------------------------------
-The producer is the entity that creates messages and sends them
-to the broker for storage.
+CONCEPT: The Producer — the Write Side
+----------------------------------------
+The producer creates messages and sends them to a broker.
 
-In Phase 1, the producer is simple:
-  - Connects to one broker
-  - Sends all messages to partition 0 of the given topic
-  - Gets back the offset assigned to each message
+    producer.send("order placed", key="user-42")
+        → encode  → TCP → broker → append to log → offset 41
+        ← offset 41 ←──────────────────────────────────────┘
 
-Phase 2 will add: multiple partitions, key-based routing,
-                  load balancing across multiple brokers.
+In Phase 0 this is as simple as it gets: one connection, one message per
+request, wait for the acknowledgement before sending the next.
 
-Producer flow:
-  1. Open a TCP connection to the broker
-  2. Build a PRODUCE message: encode_message(MSG_PRODUCE, payload)
-  3. Send it over the socket
-  4. Read the 12-byte header of the response
-  5. Read the body bytes
-  6. Parse and return the offset
 
-We use a context manager (with Producer(...) as p:) so the
-TCP connection is always properly closed.
+THE THING TO NOTICE: THIS DESIGN IS SLOW, AND THAT IS THE LESSON
+------------------------------------------------------------------
+Every `send()` costs a full network round trip, during which the producer
+does nothing at all:
+
+    send msg 1 ──────► broker
+               ◄────── ack           (wait 0.5 ms)
+    send msg 2 ──────► broker
+               ◄────── ack           (wait 0.5 ms)
+
+At 0.5 ms per round trip that caps you at ~2,000 messages/second no matter
+how fast the broker is. The broker is idle most of that time; so is the
+network; so is the producer. The bottleneck is pure latency.
+
+Real producers fix this two ways, and Phase 3 implements both:
+
+  1. **Batching** — accumulate messages in memory for a few milliseconds
+     (`linger.ms`) and send them as one request. 100 messages in one round
+     trip instead of 100 round trips. Costs a little latency, multiplies
+     throughput by ~50x.
+  2. **Pipelining** — send the next request without waiting for the previous
+     acknowledgement, matching replies to requests by correlation ID
+     (Phase 1's protocol change is what makes this possible).
+
+Both are the same insight: **the round trip is the expensive part, so amortise
+it.** Keep the Phase 0 number from `bench/bench.py` — the improvement in
+Phase 3 is one of the most dramatic in the project.
+
+
+WHAT THE PRODUCER DECIDES
+--------------------------
+The producer, not the broker, chooses which partition a message goes to. That
+sounds like a detail; it is actually the load-balancing mechanism of the whole
+system, and it is what Phase 3 is about. `key` is accepted and stored today
+but not yet used for routing — every message goes to partition 0.
 """
 
-import socket
-import sys
-import os
+import argparse
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from common.protocol import (
-    HEADER_SIZE, MAGIC,
-    MSG_PRODUCE,
-    encode_message, decode_header, decode_body
-)
+from common.config import DEFAULT_HOST, DEFAULT_PORT
+from common.net import SyncConnection
+from common.protocol import MSG_PRODUCE
 
 
 class Producer:
-    def __init__(self, host: str = 'localhost', port: int = 9092,
-                 topic: str = 'default'):
-        self.host  = host
-        self.port  = port
+    """
+    A synchronous producer bound to one topic and one broker.
+
+    Use as a context manager so the connection is always closed:
+
+        with Producer(topic='orders') as p:
+            p.send('hello')
+    """
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 topic: str = 'default', quiet: bool = False):
+        self.host = host
+        self.port = port
         self.topic = topic
-        self._sock = None
 
-    # ── Connection management ──────────────────────────────────
+        # `quiet` exists for the benchmark. Printing a line per message costs
+        # more than the message does — without this, bench/bench.py would be
+        # measuring the speed of your terminal. Any measurement harness needs
+        # a way to silence the thing it is measuring.
+        self.quiet = quiet
 
-    def connect(self):
-        """
-        Open a persistent TCP connection to the broker.
+        self._conn = SyncConnection(host, port)
 
-        CONCEPT: Persistent connection
-          We keep one TCP connection open for the lifetime of the producer.
-          This is more efficient than opening a new connection per message
-          (TCP handshake overhead would dominate for small messages).
-        """
-        self._sock = socket.create_connection((self.host, self.port))
-        print(f"[Producer] Connected to broker at {self.host}:{self.port}")
+    # ── Connection lifecycle ───────────────────────────────────
 
-    def close(self):
-        if self._sock:
-            self._sock.close()
-            self._sock = None
-
-    def __enter__(self):
-        self.connect()
+    def connect(self) -> 'Producer':
+        self._conn.connect()
+        self._log(f"Connected to broker at {self.host}:{self.port}")
         return self
 
-    def __exit__(self, *args):
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> 'Producer':
+        return self.connect()
+
+    def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # ── Core operation: send one message ──────────────────────
+    # ── Sending ────────────────────────────────────────────────
 
     def send(self, value: str, key: str = None, partition: int = 0) -> int:
         """
-        Send one message to the broker and return the assigned offset.
+        Send one message; block until the broker acknowledges; return the
+        offset it was assigned.
 
         Args:
-            value     : the message content (any string)
-            key       : optional routing key (used in Phase 2 for partitioning)
-            partition : which partition to write to (always 0 in Phase 1)
+            value:     the message body.
+            key:       routing key. Stored today, used for partition routing
+                       from Phase 3 — messages with the same key will land in
+                       the same partition, which is how per-key ordering is
+                       guaranteed.
+            partition: explicit target partition. Always 0 until Phase 3.
 
-        Returns:
-            The offset assigned to this message by the broker.
+        CONCEPT: The returned offset is a receipt.
+          Getting an offset back means the broker has the message in its log.
+          It does NOT yet mean the message is safe — it is in the OS page
+          cache, not on a platter, and there is only one copy of it.
 
-        Example:
-            offset = producer.send("order placed", key="user-42")
-            print(f"Stored at offset {offset}")
+          Phase 3 makes that explicit with `acks` (0 = do not wait, 1 = leader
+          has it, all = every replica has it) and Phase 6 makes `acks=all`
+          meaningful by adding replicas. Right now every send is effectively
+          `acks=1` against a single copy.
         """
-        if not self._sock:
-            raise RuntimeError("Not connected. Call connect() first.")
-
-        # Build payload dict
-        payload = {
-            'topic'    : self.topic,
+        response = self._conn.request(MSG_PRODUCE, {
+            'topic':     self.topic,
             'partition': partition,
-            'value'    : value,
-            'key'      : key
-        }
+            'value':     value,
+            'key':       key,
+        })
 
-        # Encode to wire format: 12-byte header + JSON body
-        message_bytes = encode_message(MSG_PRODUCE, payload)
+        if response.get('status') != 'ok':
+            # Phase 1 replaces this string with a numeric error code, which
+            # is what lets a client decide *programmatically* whether an
+            # error is worth retrying. Matching on error prose is not a plan.
+            raise RuntimeError(
+                f"Broker rejected the message: {response.get('reason', response)}")
 
-        # ── Send ────────────────────────────────────────────────
-        # sendall() keeps sending until all bytes are delivered
-        # (socket.send() might only send part of the data)
-        self._sock.sendall(message_bytes)
-
-        # ── Receive response ────────────────────────────────────
-        response = self._recv_response()
-        offset   = response.get('offset', -1)
-
-        print(f"[Producer] SENT value={value!r} key={key!r} "
-              f"→ topic={self.topic} partition={partition} offset={offset}")
+        offset = response['offset']
+        self._log(f"SENT value={value!r} key={key!r} → "
+                  f"{self.topic}-{partition} offset={offset}")
         return offset
 
-    # ── Helper: receive one response from broker ──────────────
-
-    def _recv_response(self) -> dict:
+    def send_many(self, values, key: str = None, partition: int = 0) -> list:
         """
-        Read exactly one response from the broker.
+        Convenience wrapper: send an iterable of values, return their offsets.
 
-        CONCEPT: Length-prefixed protocol
-          We always read the fixed 12-byte header first to find out
-          how many bytes the body is. Then we read exactly that many
-          bytes. This avoids the "where does one message end and the
-          next begin?" problem of stream-based TCP.
+        Note this is NOT batching — it is a loop of individual round trips,
+        with all the cost described in the module docstring. Real batching
+        arrives in Phase 3, and the benchmark difference between this method
+        and that one is the point.
         """
-        # Read exactly 12 bytes (the header)
-        header_bytes = self._recvexactly(HEADER_SIZE)
-        magic, body_length, msg_type = decode_header(header_bytes)
+        return [self.send(v, key=key, partition=partition) for v in values]
 
-        if magic != MAGIC:
-            raise ValueError(f"Invalid magic number in response: {magic:#x}")
+    # ── Internals ──────────────────────────────────────────────
 
-        # Read exactly body_length bytes
-        body_bytes = self._recvexactly(body_length)
-        return decode_body(body_bytes)
+    def _log(self, message: str) -> None:
+        if not self.quiet:
+            print(f"[Producer] {message}")
 
-    def _recvexactly(self, n: int) -> bytes:
-        """
-        CONCEPT: recv() is not guaranteed to return n bytes
-          TCP is a stream — socket.recv(n) may return fewer than n bytes
-          if the data hasn't fully arrived yet.
-          We loop until we have exactly n bytes.
-        """
-        data = b''
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                raise ConnectionError("Broker closed connection unexpectedly")
-            data += chunk
-        return data
+    def __repr__(self) -> str:
+        return f"Producer(topic={self.topic!r}, broker={self.host}:{self.port})"
 
 
-# ── Quick test ─────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────
 
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Kafka-clone producer')
-    parser.add_argument('--host',  default='localhost')
-    parser.add_argument('--port',  type=int, default=9092)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Kafka-clone producer  (run with: python -m producer.producer)')
+    parser.add_argument('--host', default=DEFAULT_HOST)
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT)
     parser.add_argument('--topic', default='orders')
     parser.add_argument('--count', type=int, default=5,
-                        help='Number of test messages to send')
+                        help='How many test messages to send')
+    parser.add_argument('--prefix', default='message',
+                        help='Text prefix for generated messages')
+    parser.add_argument('--quiet', action='store_true')
     args = parser.parse_args()
 
-    with Producer(args.host, args.port, args.topic) as p:
+    with Producer(args.host, args.port, args.topic, quiet=args.quiet) as producer:
         for i in range(args.count):
-            p.send(f"message-{i}", key=f"key-{i % 3}")
+            producer.send(f"{args.prefix}-{i}", key=f"key-{i % 3}")
 
-    print(f"\nDone. Sent {args.count} messages to topic '{args.topic}'.")
+    print(f"\nDone. Sent {args.count} messages to topic {args.topic!r}.")
+
+
+if __name__ == '__main__':
+    main()

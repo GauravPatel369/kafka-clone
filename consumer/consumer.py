@@ -1,235 +1,378 @@
 """
-CONCEPT: The Consumer — TCP Client (Read Side)
-------------------------------------------------
-The consumer reads messages from the broker partition by partition,
-tracking its own position using an offset.
+CONCEPT: The Consumer — the Read Side
+---------------------------------------
+The consumer reads messages from a partition, tracking its own position with
+an integer called the offset.
 
-Key insight: THE BROKER DOESN'T TRACK WHAT YOU'VE READ.
-  The consumer is responsible for remembering its offset.
-  If the consumer restarts, it reads its last saved offset from
-  a local file and resumes from exactly where it left off.
+The single most important sentence in this file:
 
-Consumer flow:
-  1. Load last saved offset from disk (or start from 0)
-  2. Connect to broker
-  3. poll() in a loop:
-     a. Send FETCH request with current offset
-     b. Receive list of messages from broker
-     c. Process each message
-     d. Update offset to (last_message_offset + 1)
-     e. Save offset to disk
-     f. Sleep briefly, then repeat
+    THE BROKER DOES NOT TRACK WHAT YOU HAVE READ.
 
-CONCEPT: Consumer offset file
-  The offset is saved as a plain text file:
-      ./offsets/orders-0-group1.txt
-  Contents: just the integer offset, e.g. "42"
+In a traditional queue the broker remembers, per message per consumer, whether
+it was delivered and acknowledged. That bookkeeping is what makes queue brokers
+expensive. Kafka pushes the responsibility to the consumer, which then only has
+to remember ONE INTEGER per partition. That is the whole scalability story.
 
-  Why save to disk?
-    If the consumer process crashes at offset 42 and restarts,
-    it reads "42" from the file and continues from message 42.
-    Without this, it would start from 0 and reprocess everything.
+The price is that the consumer now owns a correctness problem: *when* it
+records that integer decides whether crashes lose messages or duplicate them.
+
+
+PULL, NOT PUSH
+---------------
+The consumer asks for messages; the broker never sends unsolicited data.
+
+  ┌─────────┬──────────────────────────────────────────────────────────────┐
+  │ PUSH    │ Broker sends as soon as data exists. Lowest latency. But the │
+  │         │ broker must track each consumer's speed, and a slow consumer │
+  │         │ gets overwhelmed — you need a flow-control protocol to stop  │
+  │         │ the broker drowning it.                                      │
+  ├─────────┼──────────────────────────────────────────────────────────────┤
+  │ PULL    │ Consumer asks when ready, so it can never be overwhelmed —   │
+  │  ← ours │ flow control is automatic. It can batch as much as it likes. │
+  │         │ Recovery is trivial: re-ask for the same offset. Cost: when  │
+  │         │ idle you either poll and waste requests, or wait and add     │
+  │         │ latency. (Real Kafka's long-poll gets both; see config.py.)  │
+  └─────────┴──────────────────────────────────────────────────────────────┘
+
+
+THE COMMIT IS EXPLICIT, AND THAT IS THE POINT
+-----------------------------------------------
+The original version committed the offset inside `poll()`, before the caller
+had processed anything. That is **at-most-once** delivery: crash while
+processing and those messages are gone forever, because the saved offset
+already claims they are done.
+
+    fetch ──► commit ──► process        fetch ──► process ──► commit
+                    ▲                                     ▲
+                 crash = LOST                          crash = REDELIVERED
+              (at-most-once)                           (at-least-once)
+
+`poll()` now only fetches and advances an in-memory position. `commit()` is a
+separate call. You choose the semantics by choosing where you call it — which
+is exactly how the real Kafka consumer API works, and why `enable.auto.commit`
+is the most consequential one-line config in Kafka.
+
+We default to at-least-once. Duplicates have a cure (make your processing
+idempotent); silently lost data does not.
+
+Note that at-least-once is NOT achieved by committing "after processing" in
+some vague sense — it is achieved because a crash before the commit leaves the
+*previous* offset on disk, so the next run re-fetches from there. The commit is
+the only durable statement the consumer ever makes.
 """
 
-import socket
+import argparse
 import os
-import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from common.protocol import (
-    HEADER_SIZE, MAGIC,
-    MSG_FETCH,
-    encode_message, decode_header, decode_body
+from common.config import (
+    DEFAULT_HOST, DEFAULT_MAX_MESSAGES, DEFAULT_OFFSET_DIR,
+    DEFAULT_POLL_INTERVAL, DEFAULT_PORT,
 )
+from common.net import SyncConnection
+from common.protocol import MSG_FETCH
 
 
 class Consumer:
-    def __init__(self, host: str = 'localhost', port: int = 9092,
-                 topic: str = 'default', partition: int = 0,
-                 group_id: str = 'group-1', offset_dir: str = './offsets'):
-        self.host      = host
-        self.port      = port
-        self.topic     = topic
-        self.partition = partition
-        self.group_id  = group_id
+    """
+    Reads one partition of one topic, remembering its position on local disk.
 
-        # Load the last committed offset from disk
-        # If first run, starts from 0
+    "One partition" is a real Phase 0 limitation. A consumer *group* that
+    splits many partitions across many members — and reassigns them when a
+    member dies — is Phase 4. Here, `group_id` only namespaces the offset
+    file, so two consumers in the same group both read everything and fight
+    over the same file.
+    """
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 topic: str = 'default', partition: int = 0,
+                 group_id: str = 'group-1',
+                 offset_dir: str = DEFAULT_OFFSET_DIR,
+                 quiet: bool = False):
+        self.host = host
+        self.port = port
+        self.topic = topic
+        self.partition = partition
+        self.group_id = group_id
+        self.quiet = quiet
+
         os.makedirs(offset_dir, exist_ok=True)
         self._offset_file = os.path.join(
-            offset_dir,
-            f"{topic}-{partition}-{group_id}.txt"
-        )
-        self.offset = self._load_offset()
+            offset_dir, f"{topic}-{partition}-{group_id}.txt")
 
-        self._sock = None
-        print(f"[Consumer] group={group_id} topic={topic} "
-              f"partition={partition} starting_offset={self.offset}")
+        # TWO positions, and the gap between them is where crash-safety lives.
+        #
+        #   position  — the next offset to FETCH. In memory only. Advances on
+        #               every poll.
+        #   committed — the last offset durably written to disk. This is what
+        #               a restart resumes from.
+        #
+        # position >= committed always. Everything in between is "fetched but
+        # not yet declared done", and is exactly what gets redelivered after
+        # a crash. The size of that gap is your duplicate window.
+        self.committed = self._load_offset()
+        self.position = self.committed
 
-    # ── Connection management ──────────────────────────────────
+        # Last high watermark the broker reported: one past the newest message
+        # in the partition. Used by lag(). Starts equal to our position, so
+        # lag reads as 0 until we have actually asked the broker anything.
+        self.high_watermark = self.position
 
-    def connect(self):
-        self._sock = socket.create_connection((self.host, self.port))
-        print(f"[Consumer] Connected to broker at {self.host}:{self.port}")
+        self._conn = SyncConnection(host, port)
 
-    def close(self):
-        if self._sock:
-            self._sock.close()
-            self._sock = None
+        self._log(f"group={group_id} {topic}-{partition} "
+                  f"starting at offset {self.position}")
 
-    def __enter__(self):
-        self.connect()
+    # ── Connection lifecycle ───────────────────────────────────
+
+    def connect(self) -> 'Consumer':
+        self._conn.connect()
+        self._log(f"Connected to broker at {self.host}:{self.port}")
         return self
 
-    def __exit__(self, *args):
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> 'Consumer':
+        return self.connect()
+
+    def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # ── Core operation: fetch messages ─────────────────────────
+    # ── Reading ────────────────────────────────────────────────
 
-    def poll(self, max_messages: int = 10) -> list:
+    def poll(self, max_messages: int = DEFAULT_MAX_MESSAGES) -> list:
         """
-        Fetch the next batch of messages from the broker.
+        Fetch the next batch of messages. Returns [] when caught up.
 
-        CONCEPT: Pull-based consumption
-          Consumers PULL from the broker (they ask "give me messages").
-          This is different from push-based systems where the broker
-          PUSHES messages to consumers.
-
-          Pull is better because:
-          - Consumer controls its own pace (no buffer overflow)
-          - Consumer can batch-process efficiently
-          - Simple to implement fault tolerance (just retry the same offset)
-
-        Returns a list of message dicts. Empty list = no new messages yet.
+        Advances `position` in memory. **Commits nothing.** Call `commit()`
+        once you have actually processed what you got back.
         """
-        if not self._sock:
-            raise RuntimeError("Not connected. Call connect() first.")
-
-        # Build FETCH request
-        payload = {
-            'topic'    : self.topic,
+        response = self._conn.request(MSG_FETCH, {
+            'topic':     self.topic,
             'partition': self.partition,
-            'offset'   : self.offset,    # "give me messages from here"
-            'max'      : max_messages
-        }
+            'offset':    self.position,
+            'max':       max_messages,
+        })
 
-        self._sock.sendall(encode_message(MSG_FETCH, payload))
+        if response.get('status') != 'ok':
+            raise RuntimeError(f"Fetch failed: {response.get('reason', response)}")
 
-        # Receive response
-        response = self._recv_response()
         messages = response.get('messages', [])
+        self.high_watermark = response.get('high_watermark', self.position)
 
         if messages:
-            # CONCEPT: Advance the offset
-            # After receiving messages, move our offset past the last one
-            # so the next poll() starts from where we left off
-            last_offset = messages[-1]['offset']
-            self.offset = last_offset + 1
-
-            # Save offset to disk immediately
-            # This is called "committing" the offset
-            self._save_offset()
-
-            print(f"[Consumer] Received {len(messages)} messages | "
-                  f"new offset: {self.offset}")
+            # Advance past the last message we received.
+            #
+            # We use the last record's own offset rather than
+            # `position + len(messages)`: the two are the same today, but they
+            # stop being the same the moment Phase 2 adds compaction (which
+            # leaves gaps in the offset sequence). Trusting the data over an
+            # assumption about the data is the habit worth building.
+            self.position = messages[-1]['offset'] + 1
+            self._log(f"fetched {len(messages)} messages, position now {self.position}")
         else:
-            print(f"[Consumer] No new messages at offset {self.offset}")
+            self._log(f"no new messages at offset {self.position}")
 
         return messages
 
-    def consume_loop(self, process_fn, poll_interval: float = 1.0):
+    def lag(self) -> int:
         """
-        Continuously poll for messages and call process_fn on each one.
+        How many messages exist that this consumer has not fetched.
 
-        CONCEPT: Polling loop
-          This is the typical consumer pattern — run forever, checking
-          for new messages every poll_interval seconds.
-
-        Args:
-            process_fn   : function called with each message dict
-            poll_interval: seconds to wait between polls when no messages
-
-        Example:
-            def handle(msg):
-                print(f"Got: {msg['value']}")
-
-            consumer.consume_loop(handle)
+        THE number to alarm on in production. Steady lag means the consumer
+        keeps up. Growing lag means it does not, and at some point retention
+        will delete data the consumer has not read yet — silent loss that
+        looks like a monitoring problem right up until it is a data problem.
         """
-        print(f"[Consumer] Starting consume loop (poll every {poll_interval}s)...")
+        return max(0, self.high_watermark - self.position)
+
+    # ── Committing ─────────────────────────────────────────────
+
+    def commit(self) -> int:
+        """
+        Durably record the current position. Returns the committed offset.
+
+        This is the consumer's only promise to the world: "everything below
+        this offset is handled." Call it AFTER processing for at-least-once,
+        BEFORE for at-most-once. There is no third option.
+        """
+        if self.position != self.committed:
+            self._save_offset(self.position)
+            self.committed = self.position
+            self._log(f"committed offset {self.committed}")
+        return self.committed
+
+    def seek(self, offset: int) -> None:
+        """
+        Jump to an arbitrary offset. Does not commit — commit if you mean it.
+
+        CONCEPT: This is Kafka's superpower, and it exists only because the
+        log is not destructive. Messages are still on disk after being read,
+        so "reprocess the last three days with the fixed code" is a one-line
+        change of an integer. In a queue, consumed messages are gone and that
+        recovery is simply impossible.
+        """
+        if offset < 0:
+            raise ValueError(f"Offset must be >= 0, got {offset}")
+        self.position = offset
+        self._log(f"seek → {offset}")
+
+    def seek_to_beginning(self) -> None:
+        """Replay the partition from the start."""
+        self.seek(0)
+
+    # ── The loop ───────────────────────────────────────────────
+
+    def consume_loop(self, process_fn,
+                     poll_interval: float = DEFAULT_POLL_INTERVAL,
+                     max_messages: int = DEFAULT_MAX_MESSAGES,
+                     auto_commit: bool = True) -> None:
+        """
+        Poll forever, calling `process_fn(message)` on everything received.
+
+        The ordering here IS the delivery guarantee:
+
+            messages = poll()          # fetch
+            for m in messages:
+                process_fn(m)          # do the work
+            commit()                   # only now say it is done
+
+        If `process_fn` raises, we do not commit, and the next run re-fetches
+        from the last committed offset. Those messages are redelivered rather
+        than lost — at-least-once, by construction.
+
+        Set `auto_commit=False` when the caller wants to commit on its own
+        schedule (say, once per 1000 messages instead of once per batch:
+        fewer disk writes, but a bigger window of possible duplicates — the
+        same trade-off, with a dial on it).
+        """
+        self._log(f"consuming (poll every {poll_interval}s, "
+                  f"auto_commit={auto_commit}) — Ctrl-C to stop")
         while True:
-            messages = self.poll()
+            messages = self.poll(max_messages=max_messages)
 
-            for msg in messages:
-                process_fn(msg)
+            for message in messages:
+                process_fn(message)
+
+            if messages and auto_commit:
+                self.commit()
 
             if not messages:
-                # No new messages — wait before polling again
-                # (avoids hammering the broker with empty requests)
+                # Nothing new. Sleep rather than spin — see config.py for why
+                # this simple approach costs latency, and what real Kafka
+                # does instead (long polling).
                 time.sleep(poll_interval)
 
     # ── Offset persistence ─────────────────────────────────────
 
     def _load_offset(self) -> int:
-        """Read last saved offset from disk. Return 0 if first run."""
+        """Read the committed offset. Returns 0 on a first run."""
         try:
-            with open(self._offset_file, 'r') as f:
+            with open(self._offset_file, 'r', encoding='utf-8') as f:
                 return int(f.read().strip())
-        except (FileNotFoundError, ValueError):
-            return 0   # first run, start from the beginning
+        except FileNotFoundError:
+            return 0
+        except ValueError:
+            # An empty or garbled file. With the atomic write below this
+            # should now be unreachable — it was reachable before, and it
+            # silently restarted the consumer from zero, reprocessing the
+            # entire topic. We warn loudly instead of pretending it is normal.
+            print(f"[Consumer] WARNING: offset file {self._offset_file} is "
+                  f"unreadable; restarting from 0. This should not happen.")
+            return 0
 
-    def _save_offset(self):
-        """Write current offset to disk for crash recovery."""
-        with open(self._offset_file, 'w') as f:
-            f.write(str(self.offset))
+    def _save_offset(self, offset: int) -> None:
+        """
+        Write the offset to disk atomically.
 
-    # ── Helpers ────────────────────────────────────────────────
+        CONCEPT: Why not just open(path, 'w')?
+          Opening with 'w' TRUNCATES the file to zero bytes, and only then
+          writes. Between those two steps the file on disk is EMPTY. Crash in
+          that window — microseconds wide, but 3am is long — and the consumer
+          restarts from offset 0 and reprocesses everything.
 
-    def _recv_response(self) -> dict:
-        header_bytes = self._recvexactly(HEADER_SIZE)
-        magic, body_length, _ = decode_header(header_bytes)
-        if magic != MAGIC:
-            raise ValueError(f"Invalid magic: {magic:#x}")
-        body_bytes = self._recvexactly(body_length)
-        return decode_body(body_bytes)
+          The fix is the write-temp-then-rename dance:
 
-    def _recvexactly(self, n: int) -> bytes:
-        data = b''
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                raise ConnectionError("Broker closed connection")
-            data += chunk
-        return data
+            1. write the new content to a temporary file
+            2. flush + fsync it, so the BYTES are physically on disk
+            3. atomically rename it over the real file
+
+          A rename is atomic at the filesystem level: any reader sees either
+          the complete old file or the complete new one. There is no instant
+          at which a partial file is visible.
+
+          Step 2 is not optional. Without the fsync, the rename can reach
+          disk before the data does, leaving a correctly-named file full of
+          zeros after a power cut — the exact failure we were preventing.
+
+          `os.replace`, not `os.rename`: on Windows, rename fails if the
+          destination exists. replace overwrites on every platform.
+
+        This pattern is how editors, databases, and config managers all write
+        small files safely. Learn it once, use it everywhere.
+        """
+        tmp_path = self._offset_file + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(str(offset))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self._offset_file)
+
+    # ── Internals ──────────────────────────────────────────────
+
+    def _log(self, message: str) -> None:
+        if not self.quiet:
+            print(f"[Consumer] {message}")
+
+    def __repr__(self) -> str:
+        return (f"Consumer(group={self.group_id!r}, "
+                f"{self.topic}-{self.partition}, "
+                f"position={self.position}, committed={self.committed})")
 
 
-# ── Quick test ─────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────
 
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Kafka-clone consumer')
-    parser.add_argument('--host',      default='localhost')
-    parser.add_argument('--port',      type=int, default=9092)
-    parser.add_argument('--topic',     default='orders')
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Kafka-clone consumer  (run with: python -m consumer.consumer)')
+    parser.add_argument('--host', default=DEFAULT_HOST)
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT)
+    parser.add_argument('--topic', default='orders')
     parser.add_argument('--partition', type=int, default=0)
-    parser.add_argument('--group',     default='group-1')
-    parser.add_argument('--loop',      action='store_true',
-                        help='Run forever in polling loop')
+    parser.add_argument('--group', default='group-1')
+    parser.add_argument('--loop', action='store_true',
+                        help='Keep polling forever instead of fetching once')
+    parser.add_argument('--from-beginning', action='store_true',
+                        help='Ignore the committed offset and replay from 0')
     args = parser.parse_args()
 
-    def handle_message(msg):
-        print(f"  → offset={msg['offset']} key={msg['key']!r} "
-              f"value={msg['value']!r} ts={msg['timestamp']}")
+    def handle(message):
+        print(f"  → offset={message['offset']} key={message['key']!r} "
+              f"value={message['value']!r} ts={message['timestamp']}")
 
     with Consumer(args.host, args.port, args.topic,
-                  args.partition, args.group) as c:
+                  args.partition, args.group) as consumer:
+        if args.from_beginning:
+            consumer.seek_to_beginning()
+
         if args.loop:
-            c.consume_loop(handle_message, poll_interval=1.0)
+            try:
+                consumer.consume_loop(handle)
+            except KeyboardInterrupt:
+                # Commit what we have processed before exiting. Without this,
+                # a clean Ctrl-C would replay the last batch on restart — not
+                # incorrect (at-least-once permits it) but needlessly untidy.
+                consumer.commit()
+                print("\n[Consumer] stopped.")
         else:
-            # One-shot: fetch whatever is available right now
-            messages = c.poll(max_messages=100)
-            print(f"\nFetched {len(messages)} messages:")
-            for msg in messages:
-                handle_message(msg)
+            messages = consumer.poll()
+            print(f"\nFetched {len(messages)} messages "
+                  f"(lag now {consumer.lag()}):")
+            for message in messages:
+                handle(message)
+            consumer.commit()
+
+
+if __name__ == '__main__':
+    main()
