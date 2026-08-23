@@ -31,9 +31,11 @@ This tool grows every phase: `kfk topics` (Phase 3), `kfk groups` with lag
 """
 
 import argparse
-import json
 import os
 import sys
+
+from broker.log.index import INDEX_ENTRY_SIZE
+from broker.log.record import iter_records
 
 from common.config import (
     DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_OFFSET_DIR, DEFAULT_PORT,
@@ -115,14 +117,22 @@ def cmd_describe(args) -> int:
         'timestamp': TIMESTAMP_LATEST})['offset']
 
     count = latest - earliest
-    log_path = os.path.join(args.data_dir, f"{args.topic}-{args.partition}.log")
-    size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+
+    # A partition is a DIRECTORY of segments now, not a single file, so the
+    # size is the sum of its .log files.
+    directory = _partition_dir(args)
+    segments = []
+    size = 0
+    if os.path.isdir(directory):
+        segments = sorted(n for n in os.listdir(directory) if n.endswith('.log'))
+        size = sum(os.path.getsize(os.path.join(directory, n)) for n in segments)
 
     print(f"Topic     : {args.topic}")
     print(f"Partition : {args.partition}")
     print(f"Broker    : {args.host}:{args.port}")
     print(f"Offsets   : earliest={earliest}  latest={latest}  ({count} messages)")
-    print(f"Log file  : {log_path}")
+    print(f"Directory : {directory}")
+    print(f"Segments  : {len(segments)}")
     print(f"Log size  : {size:,} bytes"
           + (f"   (~{size // count} bytes/message)" if count else ""))
 
@@ -155,51 +165,138 @@ def cmd_tail(args) -> int:
     return 0
 
 
+def _partition_dir(args) -> str:
+    return os.path.join(args.data_dir, f"{args.topic}-{args.partition}")
+
+
 def cmd_dump_log(args) -> int:
     """
-    Read the log file straight off disk — no broker required.
+    Read the segment files straight off disk — no broker required.
 
-    Also reports unparseable lines. A non-zero corrupt count means the log has
-    been damaged (a torn write, a crash mid-flush) and the broker has been
-    silently skipping those records. Silence is exactly the problem.
+    CONCEPT: why a tool replaced `cat`.
+      Through Phase 1 a log was JSON lines, so `cat` was a perfectly good
+      reader. Phase 2's records carry a length prefix and a CRC32, which makes
+      the file binary and `cat` useless.
+
+      That was a real teaching benefit to give up, so it is replaced
+      deliberately — and the replacement does something `cat` never could:
+      **it verifies the checksums.** Real Kafka made the same trade and ships
+      `kafka-dump-log.sh` for the same reason.
+
+    Reading files directly, rather than asking the broker, matters most when
+    the broker is down or wedged — which is exactly when you need to look.
     """
-    log_path = os.path.join(args.data_dir, f"{args.topic}-{args.partition}.log")
-    if not os.path.exists(log_path):
-        print(f"No log file at {log_path}", file=sys.stderr)
+    directory = _partition_dir(args)
+    if not os.path.isdir(directory):
+        print(f"No partition directory at {directory}", file=sys.stderr)
+        print("(Phase 2 stores a partition as a DIRECTORY of segments. "
+              "Old flat .log files from Phase 0/1 cannot be read.)", file=sys.stderr)
         return 1
 
-    total = corrupt = 0
+    total = 0
     offsets = []
+    damaged_total = 0
 
-    print(f"{log_path}\n")
-    with open(log_path, 'r', encoding='utf-8', newline='\n') as f:
-        for line_number, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            total += 1
-            try:
-                record = json.loads(line)
+    print(f"{directory}\n")
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith('.log'):
+            continue
+
+        path = os.path.join(directory, name)
+        file_size = os.path.getsize(path)
+        count = 0
+        valid_end = 0
+
+        print(f"  {name}  ({file_size:,} bytes)")
+        with open(path, 'rb') as fh:
+            # iter_records stops at the first record that fails its length or
+            # CRC check, so anything between where it stops and the end of the
+            # file is damage.
+            for position, size, record in iter_records(fh):
+                count += 1
+                valid_end = position + size
                 offsets.append(record['offset'])
                 if args.verbose:
-                    print(f"  {record['offset']:<8} {record['value']!r}")
-            except (json.JSONDecodeError, KeyError):
-                corrupt += 1
-                print(f"  line {line_number}: CORRUPT — {line[:60]!r}")
+                    print(f"    {record['offset']:<10} pos={position:<9} "
+                          f"key={str(record['key']):<10} {record['value']!r}")
 
-    print(f"\n  records        : {total}")
-    print(f"  corrupt lines  : {corrupt}")
-    print(f"  bytes          : {os.path.getsize(log_path):,}")
+        damaged = file_size - valid_end
+        damaged_total += damaged
+        note = f"   ⚠ {damaged:,} DAMAGED BYTES at the tail" if damaged else ""
+        print(f"    {count} records{note}")
+
+        index_path = path[:-4] + '.index'
+        if os.path.exists(index_path):
+            entries = os.path.getsize(index_path) // INDEX_ENTRY_SIZE
+            ratio = (os.path.getsize(index_path) / file_size * 100) if file_size else 0
+            print(f"    index: {entries} entries ({ratio:.2f}% of the log)")
+        print()
+
+    print(f"  records        : {total or len(offsets)}")
+    print(f"  damaged bytes  : {damaged_total:,}")
 
     if offsets:
         expected = list(range(offsets[0], offsets[0] + len(offsets)))
         if offsets != expected:
-            # Today this can only mean corruption — offsets are dense. From
-            # Phase 2 on, log compaction legitimately creates gaps, and this
-            # message will need to learn the difference.
+            # Offsets are dense today. Compaction (not yet implemented) would
+            # legitimately create gaps, and this check will need to learn the
+            # difference when it arrives.
             print("  ⚠ offsets are NOT dense — gaps or duplicates present")
         else:
             print(f"  offsets        : {offsets[0]}..{offsets[-1]} (dense ✓)")
+
+    if damaged_total:
+        print("\n  Damage is repaired the next time the broker opens this "
+              "\n  partition: recovery truncates back to the last valid record.")
+    return 0
+
+
+def cmd_segments(args) -> int:
+    """
+    List the segments of a partition, with sizes and index density.
+
+    The clearest way to see that a log is many files, not one — and to check
+    that the sparse index really is sparse. If the index is a large fraction of
+    the log, `index_interval_bytes` is too small; if there is one entry for a
+    huge segment, it is too large and reads are scanning far more than they
+    should.
+    """
+    directory = _partition_dir(args)
+    if not os.path.isdir(directory):
+        print(f"No partition directory at {directory}", file=sys.stderr)
+        return 1
+
+    names = sorted(n for n in os.listdir(directory) if n.endswith('.log'))
+    if not names:
+        print(f"{directory} has no segments.")
+        return 0
+
+    print(f"{args.topic}-{args.partition}   ({len(names)} segment(s))\n")
+    print(f"  {'BASE OFFSET':>14}  {'LOG BYTES':>12}  {'INDEX ENTRIES':>14}  "
+          f"{'INDEX %':>8}  STATE")
+
+    total_log = total_index = 0
+    for i, name in enumerate(names):
+        base_offset = int(name[:20])
+        log_size = os.path.getsize(os.path.join(directory, name))
+        index_path = os.path.join(directory, name[:-4] + '.index')
+        index_size = os.path.getsize(index_path) if os.path.exists(index_path) else 0
+        entries = index_size // INDEX_ENTRY_SIZE
+        ratio = (index_size / log_size * 100) if log_size else 0
+        state = 'ACTIVE' if i == len(names) - 1 else 'sealed'
+
+        print(f"  {base_offset:>14}  {log_size:>12,}  {entries:>14}  "
+              f"{ratio:>7.2f}%  {state}")
+        total_log += log_size
+        total_index += index_size
+
+    print(f"\n  total log   : {total_log:,} bytes")
+    print(f"  total index : {total_index:,} bytes "
+          f"({total_index / total_log * 100:.2f}% overhead)"
+          if total_log else "")
+    print("\n  Only the ACTIVE segment takes writes. Sealed segments are "
+          "immutable,\n  which is why startup only has to scan one file and why "
+          "retention\n  can delete whole files instead of rewriting them.")
     return 0
 
 
@@ -263,11 +360,17 @@ def main() -> int:
     p.add_argument('--count', type=int, default=10)
     p.set_defaults(func=cmd_tail)
 
-    p = sub.add_parser('dump-log', help='read the log file directly (no broker)')
+    p = sub.add_parser('dump-log',
+                       help='read segments directly and verify CRCs (no broker)')
     p.add_argument('--topic', required=True)
     p.add_argument('--partition', type=int, default=0)
     p.add_argument('--verbose', '-v', action='store_true', help='print every record')
     p.set_defaults(func=cmd_dump_log)
+
+    p = sub.add_parser('segments', help='list a partition\'s segments and index density')
+    p.add_argument('--topic', required=True)
+    p.add_argument('--partition', type=int, default=0)
+    p.set_defaults(func=cmd_segments)
 
     p = sub.add_parser('offsets', help='list local committed consumer offsets')
     p.set_defaults(func=cmd_offsets)

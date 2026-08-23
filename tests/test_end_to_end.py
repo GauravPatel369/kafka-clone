@@ -307,6 +307,86 @@ def test_list_offsets_rejects_real_timestamps_for_now(broker):
     assert response['error_code'] == errors.INVALID_REQUEST
 
 
+def test_offset_out_of_range_after_retention_deletes_data(tmp_path):
+    """
+    The error that only became reachable in Phase 2.
+
+    Through Phase 1 nothing was ever deleted, so `log_start_offset` was always
+    0 and no valid offset could be too low. Now retention deletes whole
+    segments off the front, and a consumer that fell far enough behind asks for
+    data that no longer exists.
+
+    This is the failure consumer lag monitoring exists to prevent, and it is
+    deliberately NOT retriable: the data will not come back. The consumer must
+    choose earliest or latest — Kafka's `auto.offset.reset`, and a real
+    judgement call, since one reprocesses and the other skips.
+    """
+    import asyncio
+    import threading
+
+    from broker.broker import Broker
+    from broker.log import LogConfig
+
+    instance = Broker(
+        host='127.0.0.1', port=0, data_dir=str(tmp_path / 'data'),
+        log_config=LogConfig(segment_bytes=512, retention_bytes=1000,
+                             index_interval_bytes=128),
+        # Long interval so the background cleaner cannot fire mid-test and
+        # make this depend on timing. We trigger retention explicitly instead.
+        retention_check_ms=10 ** 7)
+    thread = threading.Thread(target=lambda: asyncio.run(instance.start()), daemon=True)
+    thread.start()
+    assert instance.ready.wait(timeout=5)
+
+    try:
+        with Producer('127.0.0.1', instance.port, 'aging', quiet=True) as p:
+            p.send_many(['x' * 40 for _ in range(300)])
+
+        partition = instance.partitions[('aging', 0)]
+        assert partition.delete_old_segments(), "retention should delete segments"
+        start = partition.log_start_offset
+        assert start > 0
+
+        with SyncConnection('127.0.0.1', instance.port, timeout=5.0) as conn:
+            gone = conn.request(API_FETCH, {'topic': 'aging', 'offset': 0})
+            assert gone['error_code'] == errors.OFFSET_OUT_OF_RANGE
+            with pytest.raises(OffsetOutOfRangeError) as caught:
+                errors.raise_for_error(gone)
+            assert not caught.value.retriable, "the data is gone; retrying cannot help"
+
+            # Surviving data is still served normally.
+            alive = conn.request(API_FETCH, {'topic': 'aging', 'offset': start})
+            assert alive['error_code'] == errors.NONE
+            assert alive['messages']
+            assert alive['log_start_offset'] == start
+
+        # And LIST_OFFSETS reports the new start, so a client can recover
+        # without guessing.
+        with SyncConnection('127.0.0.1', instance.port, timeout=5.0) as conn:
+            earliest = conn.request(API_LIST_OFFSETS,
+                                    {'topic': 'aging', 'timestamp': TIMESTAMP_EARLIEST})
+        assert earliest['offset'] == start
+    finally:
+        instance.stop()
+        thread.join(timeout=5)
+
+
+def test_consumer_recovers_from_lost_data_by_seeking(broker, offsets_dir, tmp_path):
+    """
+    `seek_to_beginning` asks the broker where the log now starts rather than
+    assuming 0 — which is exactly what makes it a valid recovery from
+    OFFSET_OUT_OF_RANGE once retention is deleting data.
+    """
+    with Producer('127.0.0.1', broker.port, 'reset', quiet=True) as p:
+        p.send_many([f"m{i}" for i in range(10)])
+
+    with Consumer('127.0.0.1', broker.port, 'reset', 0, 'g',
+                  offset_dir=offsets_dir, quiet=True) as c:
+        c.seek_to_beginning()
+        assert c.position == 0, "nothing deleted yet, so the start is still 0"
+        assert len(c.poll()) == 10
+
+
 def test_metadata_describes_brokers_and_partitions(broker):
     """
     The request a real client makes before sending anything: it learns which

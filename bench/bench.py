@@ -222,6 +222,45 @@ def bench_consume(port: int, topic: str, count: int, batch: int) -> tuple:
     return elapsed, latencies, received
 
 
+def bench_seek_profile(port: int, topic: str, count: int, samples: int = 9) -> list:
+    """
+    Time a fetch from evenly spaced points through the log.
+
+    **THE Phase 2 measurement.** It answers one question: does read cost depend
+    on how much data the log already holds?
+
+        Phase 1 (scan from byte zero)   latency climbs linearly with offset
+        Phase 2 (segments + index)      latency is flat
+
+    A throughput number cannot show this — throughput averages the cheap early
+    reads with the expensive late ones and reports something in between. You
+    have to sample *across* the log to see the shape.
+
+    Each sample is repeated and the MINIMUM is taken. For a question about
+    algorithmic cost, the minimum is the cleanest estimator: it strips out
+    scheduler noise and background load, which add time but never remove it.
+    (For a question about user experience you would want p99 instead — the
+    right statistic depends on the question.)
+    """
+    results = []
+    repeats = 5
+
+    with SyncConnection('127.0.0.1', port, timeout=30.0) as conn:
+        conn.request(API_FETCH, {'topic': topic, 'offset': 0, 'max': 1})   # warm-up
+
+        for i in range(samples):
+            offset = int(count * i / samples)
+            best = float('inf')
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                conn.request(API_FETCH,
+                             {'topic': topic, 'offset': offset, 'max': 10})
+                best = min(best, (time.perf_counter() - t0) * 1000)
+            results.append((offset, best))
+
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Kafka-clone benchmark  (run with: python -m bench.bench)')
@@ -300,6 +339,20 @@ def main() -> None:
             broker.port, topic, args.count, args.batch)
         print(format_row(f'CONSUME ({args.batch} messages per round trip)',
                          received, c_elapsed, args.size, summarise(c_latencies)))
+
+        # ── The Phase 2 result ─────────────────────────────────
+        profile = bench_seek_profile(broker.port, topic, args.count)
+        first_ms = profile[0][1]
+        last_ms = profile[-1][1]
+        slope = (last_ms / first_ms) if first_ms else 0
+
+        print(f"\n  SEEK PROFILE — fetch latency vs position in the log")
+        print(f"    {'OFFSET':>10}  {'LATENCY (ms)':>13}")
+        for offset, ms in profile:
+            bar = '█' * max(1, int(ms / max(last_ms, first_ms, 0.001) * 30))
+            print(f"    {offset:>10}  {ms:>13.3f}  {bar}")
+        print(f"\n    end/start ratio: {slope:.2f}x"
+              f"   ← flat (~1x) means read cost is independent of log size")
     finally:
         broker.stop()
         thread.join(timeout=5)
