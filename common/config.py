@@ -31,6 +31,57 @@ DEFAULT_DATA_DIR   = './data'      # broker-side: partition log files
 DEFAULT_OFFSET_DIR = './offsets'   # consumer-side: committed offsets
                                    # (moves server-side in Phase 4)
 
+# ── Storage engine (Phase 2) ───────────────────────────────────
+#
+# Every one of these is a real Kafka setting under a similar name, so the
+# reasoning transfers even where the value does not.
+
+# Roll a new segment once the active one reaches this size.
+#
+# Real Kafka defaults to 1 GB. We use 1 MB so that segment rolling is
+# observable in a demo — with 1 GB you would produce for a week before seeing
+# a second file, and a mechanism you never watch happen is a mechanism you do
+# not understand.
+DEFAULT_SEGMENT_BYTES = 1 * 1024 * 1024        # 1 MB
+
+# Roll a segment this old even if it is not full. 7 days, matching Kafka.
+#
+# Why bother? Retention only ever deletes SEALED segments, so a low-traffic
+# topic whose single segment never fills would keep its data forever no matter
+# what retention says. This is what stops that.
+DEFAULT_SEGMENT_MS = 7 * 24 * 60 * 60 * 1000
+
+# Add an index entry roughly every this many bytes. Kafka's default.
+#
+# This is the sparseness dial. Smaller = bigger index, shorter scan after the
+# seek. Larger = tiny index, longer scan. Set it huge and you have effectively
+# removed the index and gone back to Phase 1's O(n) reads.
+DEFAULT_INDEX_INTERVAL_BYTES = 4096
+
+# Delete segments whose newest record is older than this. 7 days, matching Kafka.
+DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+# Delete oldest segments once the log exceeds this total. -1 = unlimited.
+DEFAULT_RETENTION_BYTES = -1
+
+# fsync policy — both OFF by default, exactly as real Kafka ships.
+#
+# Every append already does flush(), pushing data to the OS page cache, which
+# survives the broker process being killed. fsync() pushes it to the physical
+# disk, which survives power loss, and costs ~1-10 ms instead of ~1 us.
+#
+# Kafka's position is that durability is bought with REPLICATION, not fsync:
+# three copies on three machines survive one node's page cache vanishing, so
+# paying 1000x per write to defend against something replicas already cover is
+# a bad trade. That argument only becomes valid once Phase 6 exists — until
+# then this is a documented weakness, and these dials let you measure what the
+# safe version would cost.
+DEFAULT_FSYNC_MESSAGES = 0                      # 0 = never
+DEFAULT_FSYNC_MS = 0                            # 0 = never
+
+# How often the broker runs the retention cleaner. Kafka's default is 5 minutes.
+DEFAULT_RETENTION_CHECK_MS = 60_000             # 1 minute
+
 # ── Client behaviour ───────────────────────────────────────────
 DEFAULT_MAX_MESSAGES  = 100    # messages per FETCH request
 DEFAULT_POLL_INTERVAL = 1.0    # seconds to sleep when a poll returns nothing
