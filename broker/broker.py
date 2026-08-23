@@ -72,9 +72,12 @@ import logging
 import os
 import threading
 
+from broker.log import LogConfig
 from broker.partition import Partition
 from common import errors
-from common.config import DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT
+from common.config import (
+    DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_RETENTION_CHECK_MS,
+)
 from common.protocol import (
     API_FETCH, API_LIST_OFFSETS, API_METADATA, API_PRODUCE,
     HEADER_SIZE, MAGIC, MAX_REQUEST_BYTES,
@@ -87,10 +90,18 @@ log = logging.getLogger(__name__)
 
 class Broker:
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 data_dir: str = DEFAULT_DATA_DIR, node_id: int = 0):
+                 data_dir: str = DEFAULT_DATA_DIR, node_id: int = 0,
+                 log_config: LogConfig = None,
+                 retention_check_ms: float = DEFAULT_RETENTION_CHECK_MS):
         self.host = host
         self.port = port          # rewritten with the real port if port == 0
         self.data_dir = data_dir
+
+        # Storage tuning applied to every partition this broker creates.
+        # Real Kafka allows per-topic overrides; we have no topic metadata to
+        # hang them on until Phase 3, so it is broker-wide for now.
+        self.log_config = log_config or LogConfig()
+        self.retention_check_ms = retention_check_ms
 
         # Every broker in a cluster needs a stable identity: partition
         # assignments, leadership, and replica sets are all expressed as
@@ -142,8 +153,19 @@ class Broker:
         key = (topic, partition_id)
         with self._registry_lock:
             if key not in self.partitions:
-                self.partitions[key] = Partition(topic, partition_id, self.data_dir)
+                partition = Partition(topic, partition_id, self.data_dir,
+                                      self.log_config)
+                self.partitions[key] = partition
                 log.info("Created partition %s-%s", topic, partition_id)
+
+                # Report repaired damage loudly. A torn tail means the broker
+                # died mid-write or the disk lost bytes; silently fixing that
+                # without saying so is how you lose data and never find out.
+                if partition.corrupt_bytes_recovered:
+                    log.warning(
+                        "Recovered %s-%s: truncated %d corrupt bytes from the "
+                        "tail of the active segment",
+                        topic, partition_id, partition.corrupt_bytes_recovered)
             return self.partitions[key]
 
     def _find_partition(self, topic: str, partition_id: int):
@@ -531,11 +553,50 @@ class Broker:
         log.info("Data directory: %s", os.path.abspath(self.data_dir))
         self.ready.set()
 
+        cleaner = asyncio.create_task(self._retention_loop())
+
         async with server:
             await self._shutdown.wait()
 
+        cleaner.cancel()
         self._close_partitions()
         log.info("Broker stopped.")
+
+    async def _retention_loop(self) -> None:
+        """
+        Periodically delete segments that have aged out or pushed the log over
+        its size budget.
+
+        CONCEPT: retention is a background job, not part of the write path.
+          Checking on every append would add a cost to the hot path for a
+          decision that changes on the order of days. Running it on a timer
+          keeps writes fast and makes deletion coarse — a record can outlive
+          `retention_ms` by up to one check interval plus however long its
+          segment took to fill. Real Kafka behaves the same way, and it
+          surprises people expecting per-record expiry.
+
+        The whole loop is guarded: a bug in the cleaner must never take down a
+        broker that is otherwise happily serving reads and writes. Deleting old
+        data is the least urgent thing this process does.
+        """
+        interval = self.retention_check_ms / 1000.0
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                with self._registry_lock:
+                    partitions = list(self.partitions.values())
+
+                for partition in partitions:
+                    deleted = await self._run_blocking(partition.delete_old_segments)
+                    if deleted:
+                        log.info("Retention: deleted %d segment(s) from %s-%s, "
+                                 "log now starts at offset %s",
+                                 len(deleted), partition.topic,
+                                 partition.partition_id, partition.log_start_offset)
+            except asyncio.CancelledError:
+                return                  # normal shutdown
+            except Exception:
+                log.exception("Retention sweep failed; will retry next interval")
 
     def stop(self) -> None:
         """

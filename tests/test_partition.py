@@ -1,16 +1,23 @@
 """
-Tests for the storage layer.
+Tests for the Partition facade: identity, concurrency, and delegation.
 
-The partition is the foundation everything else stands on. If offsets are ever
-wrong here, then replication, consumer groups, and replay are all wrong too —
-and the symptom will show up three phases away from the cause.
+The storage format itself is tested in test_log.py. This file covers what
+`Partition` actually owns — the lock, the directory layout, and the public API
+the broker depends on.
+
+That split is deliberate and worth noticing: when Phase 2 replaced the entire
+storage engine, the tests that broke were exactly the ones that had reached
+past this API into file internals. Tests that only used `append`/`fetch`
+survived untouched. **Tests coupled to implementation detail are a cost you pay
+on every refactor.**
 """
 
-import json
+import os
 import threading
 
 import pytest
 
+from broker.log import LogConfig
 from broker.partition import Partition
 
 
@@ -26,13 +33,13 @@ def partition(tmp_path):
 def test_offsets_start_at_zero_and_increment_by_one(partition):
     assert [partition.append(f"m{i}") for i in range(5)] == [0, 1, 2, 3, 4]
     assert partition.size() == 5
+    assert partition.next_offset == 5
 
 
 def test_appended_records_are_readable_immediately(partition):
     """
-    The write handle is buffered and long-lived, so `append` must flush.
-    Without the flush the data sits in Python's buffer and `fetch` — which
-    opens its own read handle — sees an empty file.
+    Writes go through a buffered handle, so `append` must flush to the OS page
+    cache — otherwise a reader opening its own handle sees an empty file.
     """
     partition.append('hello', key='k1')
     messages = partition.fetch(0)
@@ -49,41 +56,87 @@ def test_appended_records_are_readable_immediately(partition):
 def test_fetch_returns_messages_from_the_requested_offset(partition):
     for i in range(10):
         partition.append(f"m{i}")
-
-    result = partition.fetch(start_offset=7)
-    assert [m['offset'] for m in result] == [7, 8, 9]
+    assert [m['offset'] for m in partition.fetch(7)] == [7, 8, 9]
 
 
 def test_fetch_respects_max_messages(partition):
     for i in range(100):
         partition.append(f"m{i}")
 
-    result = partition.fetch(start_offset=0, max_messages=10)
+    result = partition.fetch(0, max_messages=10)
     assert len(result) == 10
     assert result[-1]['offset'] == 9
 
 
 def test_fetch_past_the_end_returns_empty(partition):
-    """A caught-up consumer asks for an offset that does not exist yet. That
-    is the normal steady state, not an error."""
+    """
+    A caught-up consumer asks for an offset that does not exist yet. That is
+    the normal steady state of a healthy system, not an error.
+    """
     partition.append('only-one')
-    assert partition.fetch(start_offset=99) == []
+    assert partition.fetch(99) == []
 
 
-def test_fetch_on_a_partition_with_no_file_returns_empty(tmp_path):
+def test_fetch_on_a_partition_with_no_data_returns_empty(tmp_path):
     p = Partition('never-written', 0, data_dir=str(tmp_path))
     try:
         assert p.fetch(0) == []
+        assert p.next_offset == 0
+        assert p.log_start_offset == 0
     finally:
         p.close()
 
 
-# ── Recovery ───────────────────────────────────────────────────
+# ── Layout ─────────────────────────────────────────────────────
+
+def test_a_partition_is_a_directory_of_segments(tmp_path):
+    """
+    Phase 0/1 wrote one flat file, `data/orders-0.log`. A partition is now a
+    DIRECTORY holding segments and their indexes — which is what makes
+    retention (delete a file) and fast lookup (binary search the names)
+    possible at all.
+    """
+    p = Partition('orders', 3, data_dir=str(tmp_path))
+    try:
+        p.append('x')
+        assert p.dir_path == os.path.join(str(tmp_path), 'orders-3')
+        assert os.path.isdir(p.dir_path)
+
+        files = sorted(os.listdir(p.dir_path))
+        assert '00000000000000000000.log' in files
+        assert '00000000000000000000.index' in files
+    finally:
+        p.close()
+
+
+def test_log_start_offset_rises_with_retention(tmp_path):
+    """
+    Hardcoded to 0 through Phase 1 because nothing was ever deleted. Now it is
+    real — and it is what finally makes OFFSET_OUT_OF_RANGE reachable, meaning
+    "you fell so far behind that your data is gone".
+    """
+    p = Partition('aging', 0, data_dir=str(tmp_path),
+                  config=LogConfig(segment_bytes=512, retention_bytes=1000,
+                                   index_interval_bytes=128))
+    try:
+        for i in range(300):
+            p.append('x' * 40)
+        assert p.log_start_offset == 0
+
+        p.delete_old_segments()
+
+        assert p.log_start_offset > 0
+        assert p.fetch(0) == [], "data below the log start is gone, not hidden"
+    finally:
+        p.close()
+
+
+# ── Restart ────────────────────────────────────────────────────
 
 def test_offsets_continue_after_restart(tmp_path):
     """
-    The log IS the metadata. Nothing else is persisted, so the next offset has
-    to be derivable from the log alone — otherwise a restart would reissue
+    The log IS the metadata — nothing else is persisted, so the next offset has
+    to be derivable from the log alone. Otherwise a restart would reissue
     offsets that already exist and permanently corrupt the partition.
     """
     first = Partition('restart-topic', 0, data_dir=str(tmp_path))
@@ -100,66 +153,51 @@ def test_offsets_continue_after_restart(tmp_path):
         second.close()
 
 
-def test_recovery_uses_the_tail_not_a_full_scan(tmp_path):
+def test_restart_is_cheap_with_many_segments(tmp_path):
     """
-    Recovery reads the last 64 KB rather than the whole file. With enough
-    records to exceed that window, the fast path is what runs — and it must
-    still produce the right answer.
+    Only the ACTIVE segment is scanned at startup, because sealed segments are
+    immutable and cannot have been mid-write. On a large partition that is the
+    difference between seconds and hours.
     """
-    first = Partition('big-topic', 0, data_dir=str(tmp_path))
-    for i in range(2000):
-        first.append(f"padding-value-{i}-{'x' * 60}")
+    config = LogConfig(segment_bytes=512, index_interval_bytes=128)
+    first = Partition('many-segments', 0, data_dir=str(tmp_path), config=config)
+    for i in range(500):
+        first.append(f"m{i}" + 'x' * 30)
+    segment_count = len(first.log.segments)
     first.close()
 
-    assert first.bytes_on_disk() > 64 * 1024, "test needs a log bigger than the tail window"
+    assert segment_count > 5, "test needs several segments to be meaningful"
 
-    second = Partition('big-topic', 0, data_dir=str(tmp_path))
+    second = Partition('many-segments', 0, data_dir=str(tmp_path), config=config)
     try:
-        assert second.next_offset == 2000
+        assert second.next_offset == 500
+        assert len(second.log.segments) == segment_count
+        assert second.corrupt_bytes_recovered == 0
     finally:
         second.close()
 
 
-def test_recovery_falls_back_to_full_scan_when_the_tail_is_unusable(tmp_path, monkeypatch):
+def test_torn_tail_is_repaired_on_restart(tmp_path):
     """
-    Shrink the tail window to a size that cannot contain a whole record. Every
-    line in the window is then a fragment, so the fast path finds nothing and
-    must fall back to scanning — rather than guessing 0 and reissuing offsets
-    that already exist.
-    """
-    first = Partition('fallback-topic', 0, data_dir=str(tmp_path))
-    for i in range(20):
-        first.append(f"value-{i}")
-    first.close()
-
-    monkeypatch.setattr('broker.partition.TAIL_READ_BYTES', 8)
-
-    second = Partition('fallback-topic', 0, data_dir=str(tmp_path))
-    try:
-        assert second.next_offset == 20
-    finally:
-        second.close()
-
-
-def test_recovery_survives_a_torn_final_line(tmp_path):
-    """
-    Simulates a crash mid-write: the last line is truncated JSON. Recovery
-    must skip it and resume from the last COMPLETE record. It must not throw,
-    and it must not reset to 0.
+    Phase 1 could only *skip* a damaged record and leave it in the file
+    forever, with the next append landing after it. Now the file is repaired
+    and the damage is reported rather than hidden.
     """
     p = Partition('torn-topic', 0, data_dir=str(tmp_path))
     for i in range(3):
         p.append(f"good-{i}")
+    active_path = p.log.active_segment.log_path
     p.close()
 
-    with open(p.log_path, 'a', encoding='utf-8', newline='\n') as f:
-        f.write('{"offset": 3, "key": null, "value": "trunc')   # no closing brace
+    with open(active_path, 'ab') as fh:
+        fh.write(b'\x00\x00\x00\x99 half a record that never finished')
 
     recovered = Partition('torn-topic', 0, data_dir=str(tmp_path))
     try:
+        assert recovered.corrupt_bytes_recovered > 0, "damage must be counted, not hidden"
         assert recovered.next_offset == 3
         assert len(recovered.fetch(0)) == 3
-        assert recovered.corrupt_lines >= 1, "damage should be counted, not hidden"
+        assert recovered.append('after-repair') == 3
     finally:
         recovered.close()
 
@@ -168,12 +206,14 @@ def test_recovery_survives_a_torn_final_line(tmp_path):
 
 def test_concurrent_appends_never_duplicate_an_offset(partition):
     """
-    The broker runs appends in a thread pool, so this really happens.
+    The broker runs appends in a thread POOL (`run_in_executor`), so this
+    really happens.
 
-    Without the lock in `append`, two threads read the same `next_offset`,
-    both write it, and one message is silently lost while an offset goes
-    missing. Every guarantee in Kafka rests on "one offset names exactly one
-    message", so this is the most important test in the file.
+    Without the lock, two threads read the same `next_offset`, both write it,
+    and one message is silently lost while an offset goes missing. Every
+    guarantee in the system — ordering, replay, deduplication, replication —
+    rests on "one offset names exactly one message". This is the most important
+    test in the file.
     """
     threads_count, per_thread = 8, 50
     seen = []
@@ -195,22 +235,26 @@ def test_concurrent_appends_never_duplicate_an_offset(partition):
     assert sorted(seen) == list(range(total)), "offsets must be unique and dense"
     assert partition.size() == total
 
-    # And the file must contain every one of them, exactly once.
-    with open(partition.log_path, encoding='utf-8', newline='\n') as f:
-        offsets_on_disk = [json.loads(line)['offset'] for line in f if line.strip()]
-    assert sorted(offsets_on_disk) == list(range(total))
+    # And the log must contain every one of them, exactly once — read back
+    # through the public API rather than by parsing files, so this test
+    # survives the next storage change too.
+    stored = partition.fetch(0, max_messages=total * 2)
+    assert [m['offset'] for m in stored] == list(range(total))
+    assert len({m['value'] for m in stored}) == total, "no message lost or duplicated"
 
 
 # ── Lifecycle ──────────────────────────────────────────────────
-
-def test_append_after_close_raises(tmp_path):
-    p = Partition('closed-topic', 0, data_dir=str(tmp_path))
-    p.close()
-    with pytest.raises(RuntimeError):
-        p.append('nope')
-
 
 def test_close_is_idempotent(tmp_path):
     p = Partition('closed-topic', 0, data_dir=str(tmp_path))
     p.close()
     p.close()      # must not raise
+
+
+def test_verify_reports_a_clean_partition(partition):
+    for i in range(50):
+        partition.append(f"m{i}")
+
+    report = partition.verify()
+    assert report['records'] == 50
+    assert report['damaged_segments'] == 0
