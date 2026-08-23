@@ -18,7 +18,7 @@ worse than no benchmark, because it feels like evidence.
 |---|---:|---:|---:|---:|---|
 | **0 — Foundation** | 3,982 | 0.55 | 17,081 | 13.81 | Baseline. One round trip per message; O(n) log scan per fetch. |
 | **1 — Protocol v2** | 3,946 | 0.50 | 17,007 | 12.12 | Correlation IDs, API versions, error codes. Header 12→16 bytes. **No throughput change, as expected** — see below. |
-| 2 — Storage engine | | | | | Segments + sparse index → fetch should stop degrading |
+| **2 — Storage engine** | 3,718 | 0.49 | **101,732** | **1.50** | Segments + sparse index + CRC + retention. **Consume 6.0x faster, p99 8.1x lower, and now flat with log size.** |
 | 3 — Partitioning | | | | | Batching + `linger.ms` → produce should jump ~10-50x |
 | 4 — Consumer groups | | | | | Server-side offsets; expect a small commit cost |
 | 5 — Cluster | | | | | Partitions across brokers |
@@ -156,6 +156,66 @@ that measurement to the start, on an empty broker, gave a stable 38 µs.
 Differences of similar quantities are the fragile part of any measurement.
 Give them the quietest conditions available, and treat an impossible result as
 a bug in the instrument rather than a discovery.
+
+---
+
+## Phase 2: the prediction that held
+
+Phase 0 recorded a prediction: *"After segments and a sparse index, expect
+p50 ≈ p99 ≈ max: fetch cost should become independent of log size. The flatness
+of that curve is the result to check, more than the throughput number."*
+
+### The seek profile — 20,000 messages, fetching from evenly spaced points
+
+```
+    OFFSET   LATENCY (ms)
+         0          0.418  ████████████████████████████
+      2222          0.461  ██████████████████████████████
+      4444          0.456  ██████████████████████████████
+      6666          0.461  ██████████████████████████████
+      8888          0.408  ███████████████████████████
+     11111          0.437  █████████████████████████████
+     13333          0.437  █████████████████████████████
+     15555          0.433  █████████████████████████████
+     17777          0.447  ██████████████████████████████
+
+    end/start ratio: 1.07x
+```
+
+**Flat.** Reading from offset 17,777 costs the same as reading from offset 0.
+In Phase 1 the same measurement climbed linearly — 1 ms at the start of a
+5,000-message log, 12 ms at the end — because every read scanned from byte
+zero.
+
+The read path is now: binary search the segment base offsets → binary search
+that segment's sparse index → seek → scan a few KB. Every step is O(log n) or
+O(1), and **nothing in it depends on how much data the log holds.**
+
+### Throughput, like for like at 5,000 messages
+
+| | Phase 1 | Phase 2 | Change |
+|---|---:|---:|---|
+| Consume | 17,007 msg/s | **101,732 msg/s** | **6.0x** |
+| Consume p99 | 12.12 ms | **1.50 ms** | **8.1x lower** |
+| Produce | 3,946 msg/s | 3,718 msg/s | −6% |
+
+The consume gain understates the real improvement, because throughput averages
+the cheap early reads with the expensive late ones. The seek profile is the
+honest picture, and it gets better the more data you have: at 20,000 messages
+Phase 1's final fetches would have been scanning four times as far.
+
+**Produce lost ~6%**, and that is expected and correct: every record now costs
+8 more bytes (length + CRC32), a checksum computation, and an occasional index
+append. Paying 6% on writes to make reads independent of log size is a trade
+worth making every time — and the honest way to report it is as a cost, not to
+quietly omit the row.
+
+### What did *not* change
+
+Produce is still ~3,700 msg/s and still bounded by ~230 µs of per-message
+broker work. Segments did not touch that, because the bottleneck was never
+storage layout — it is one message per request. Phase 3's batching is what
+moves it.
 
 ---
 

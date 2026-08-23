@@ -62,13 +62,16 @@ python -m tools.kfk tail     --topic orders --count 5
 
 ```bash
 python -m chaos.kill_consumer_midprocess   # watch at-most-once lose data
-python -m bench.bench --count 5000         # throughput + latency percentiles
+python -m chaos.corrupt_log                # watch CRCs catch three kinds of damage
+python -m bench.bench --count 20000        # throughput, percentiles, seek profile
 pytest -q                                  # the test suite
 ```
 
-The chaos script is the most instructive 30 seconds in the repo: it runs the
-same crash twice, moving one line, and shows five messages vanish in one run
-and get reprocessed in the other.
+The chaos scripts are the most instructive minute in the repo. The first runs
+the same crash twice, moving one line, and shows five messages vanish in one
+run and get reprocessed in the other. The second corrupts a log three
+different ways — including one that Phase 1 would have served to a consumer as
+real data.
 
 ---
 
@@ -84,10 +87,18 @@ and get reprocessed in the other.
    │          │◄─── messages + high_watermark ─────│          │
    └────┬─────┘                                    └────┬─────┘
         │                                               │
-   offsets/orders-0-demo.txt                     data/orders-0.log
-   (committed position,                          (append-only JSON lines,
-    written atomically)                           one file per partition)
+   offsets/orders-0-demo.txt                     data/orders-0/
+   (committed position,                          ├── 00000000000000000000.log
+    written atomically)                          ├── 00000000000000000000.index
+                                                 └── 00000000000000011640.log  ACTIVE
 ```
+
+A partition is a **directory of segments**, each named by the offset of its
+first record. One segment is active and takes appends; the rest are sealed and
+immutable. Beside each is a sparse index (offset → byte position, ~0.2% of the
+log) that makes a read cost the same whether the log holds a thousand records
+or a billion. Every record carries a length prefix and a CRC32, so a torn write
+is detected and truncated rather than served as data.
 
 Wire format — a fixed 16-byte header so the reader always knows how much to
 read next, then a JSON body:
@@ -112,8 +123,8 @@ clients decide what to retry without parsing English.
 |---|---|---|---|
 | **0** | [Foundation](docs/phase-0/phase-0-foundation.md) | Tests, benchmarks, chaos scripts, admin CLI; four bug fixes | ✅ done |
 | **1** | [Protocol v2](docs/phase-1/phase-1-protocol.md) | Correlation IDs, API keys + versions, numeric error codes, `LIST_OFFSETS`, `METADATA` | ✅ done |
-| 2 | Storage engine | Segments, sparse index, CRC32, retention, flush policy | next |
-| 3 | Partitioning | Key hashing, batching, `acks`, retries — **load balancing** | |
+| **2** | [Storage engine](docs/phase-2/phase-2-storage.md) | Segments, sparse index, CRC32, retention, truncation | ✅ done |
+| 3 | Partitioning | Key hashing, batching, `acks`, retries — **load balancing** | next |
 | 4 | Consumer groups | Coordinator, rebalance, server-side offsets, delivery semantics | |
 | 5 | Cluster | Multi-broker, membership, controller election, metadata routing | |
 | 6 | Replication | Leader/follower, ISR, high watermark, failover — **fault tolerance** | |
@@ -140,8 +151,13 @@ system works.
 common/     protocol.py   wire format: encode/decode
             net.py        SyncConnection — framed client transport
             config.py     every default in one place
+            errors.py     numeric error codes, retriable or not
 broker/     broker.py     asyncio TCP server, request routing
-            partition.py  the append-only log
+            partition.py  identity + the write lock, over a Log
+            log/          record.py  one record: length + CRC32 + JSON
+                          index.py   sparse offset → byte position
+                          segment.py one .log and its .index
+                          log.py     ordered segments, rolling, retention
 producer/   producer.py   write client
 consumer/   consumer.py   read client, offset tracking, commit semantics
 tools/      kfk.py        admin CLI
@@ -153,6 +169,7 @@ docs/       00-overview.md          concepts, before any code
             interview-questions.md  concepts → questions, with our numbers
             phase-0/                foundation + code reading guide
             phase-1/                protocol v2
+            phase-2/                storage engine
 ```
 
 ---
@@ -163,13 +180,16 @@ Stated plainly, because a system that only lists its strengths is a sales
 pitch:
 
 - **One partition per topic, one broker.** No distribution yet — Phases 3 and 5.
-- **`fetch` is O(n).** Every read scans the log from byte zero, so latency
-  grows with log size. See the numbers in [benchmarks](docs/benchmarks.md).
-  Phase 2 fixes it.
-- **The log grows forever.** No retention or compaction until Phase 2.
+- **No compaction.** Retention deletes old segments; it cannot keep the latest
+  value per key. Phase 4's `__consumer_offsets` will need it.
 - **No fsync.** Writes reach the OS page cache, not the platter. A process
   kill loses nothing; a power cut loses the tail. Kafka's answer is
-  replication, which arrives in Phase 6.
+  replication, which arrives in Phase 6. (`fsync_messages` / `fsync_ms` let you
+  turn it on and measure what it costs.)
+- **No zero-copy reads.** Real Kafka serves consumers with `sendfile`, moving
+  bytes from page cache to socket without entering user space. We decode every
+  record into Python objects and re-serialise them — the largest remaining
+  performance gap.
 - **Consumer groups are a filename.** `group_id` only namespaces the local
   offset file; the broker knows nothing about groups. Phase 4.
 - **Offsets are local files.** Move a consumer to another machine and it
