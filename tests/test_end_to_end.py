@@ -45,7 +45,7 @@ def test_topics_are_isolated_from_each_other(broker, offsets_dir):
         p.send('a1')
         p.send('a2')
     with Producer('127.0.0.1', broker.port, 'topic-b', quiet=True) as p:
-        assert p.send('b1') == 0, "topic-b has its own offset sequence"
+        assert p.send_and_wait('b1') == 0, "topic-b has its own offset sequence"
 
     with Consumer('127.0.0.1', broker.port, 'topic-a', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
@@ -109,14 +109,20 @@ def test_pipelining_returns_replies_in_request_order(broker):
         "correctly, not merely counted")
 
 
-def test_pipelined_producer_matches_sequential_results(broker, offsets_dir):
-    """Same messages, same order, same offsets — only the waiting differs."""
-    with Producer('127.0.0.1', broker.port, 'pipe-topic', quiet=True) as p:
-        offsets = p.send_pipelined([f"m{i}" for i in range(30)])
+def test_batched_producer_matches_sequential_results(broker, offsets_dir):
+    """
+    Same messages, same order, same offsets — only the batching differs.
+
+    (Phase 1's `send_pipelined` is gone: `send()` is asynchronous now, so
+    everything batches by default and an explicit pipelining call would just be
+    a slower way to do the same thing.)
+    """
+    with Producer('127.0.0.1', broker.port, 'batch-topic', quiet=True) as p:
+        offsets = p.send_many([f"m{i}" for i in range(30)])
 
     assert offsets == list(range(30))
 
-    with Consumer('127.0.0.1', broker.port, 'pipe-topic', 0, 'g',
+    with Consumer('127.0.0.1', broker.port, 'batch-topic', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
         assert [m['value'] for m in c.poll()] == [f"m{i}" for i in range(30)]
 
@@ -634,7 +640,7 @@ def test_offsets_continue_across_a_broker_restart(tmp_path):
     thread = run(second)
     try:
         with Producer('127.0.0.1', second.port, 'durable', quiet=True) as p:
-            assert p.send('after-restart') == 5, "offsets must not reset"
+            assert p.send_and_wait('after-restart') == 5, "offsets must not reset"
     finally:
         second.stop()
         thread.join(timeout=5)

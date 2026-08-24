@@ -43,7 +43,7 @@ from common.config import (
 from common.errors import ERROR_NAMES, KafkaError, raise_for_error
 from common.net import BrokerConnectionError, SyncConnection
 from common.protocol import (
-    API_FETCH, API_LIST_OFFSETS, API_METADATA,
+    API_CREATE_TOPICS, API_FETCH, API_LIST_OFFSETS, API_METADATA,
     TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
 )
 
@@ -97,6 +97,84 @@ def cmd_metadata(args) -> int:
             print(f"    {part['partition']:<6}{part['leader']:<8}"
                   f"{str(part['replicas']):<12}{str(part['isr']):<12}"
                   f"{part['log_start_offset']:<8}{part['high_watermark']:<8}")
+    return 0
+
+
+def cmd_topics_create(args) -> int:
+    """
+    Create a topic with a chosen partition count.
+
+    Worth doing explicitly rather than relying on auto-creation, for two
+    reasons: a typo'd name auto-creates silently and your messages go where
+    nobody reads, and an auto-created topic gets ONE partition — so the
+    convenience quietly costs you all your parallelism.
+    """
+    response = _request(args, API_CREATE_TOPICS,
+                        {'topic': args.topic, 'partitions': args.partitions})
+    print(f"Created topic {response['topic']!r} with "
+          f"{response['partitions']} partition(s).")
+    if args.partitions > 1:
+        print("\nNote: the partition count is now fixed. Changing it would "
+              "\n      remap roughly (1 - old/new) of your keys to different "
+              "\n      partitions, splitting each key's history across two logs.")
+    return 0
+
+
+def cmd_topics_list(args) -> int:
+    response = _request(args, API_METADATA, {})
+    topics = response['topics']
+
+    if not topics:
+        print("No topics yet.")
+        return 0
+
+    print(f"{'TOPIC':<32}{'PARTITIONS':>11}{'MESSAGES':>11}")
+    for topic in topics:
+        messages = sum(p['high_watermark'] - p['log_start_offset']
+                       for p in topic['partitions'])
+        print(f"{topic['name']:<32}{len(topic['partitions']):>11}{messages:>11}")
+    return 0
+
+
+def cmd_topics_describe(args) -> int:
+    """
+    Show the per-partition message spread — i.e. whether load balancing worked.
+
+    A wildly uneven spread usually means one of two things: every message
+    carried the same key (all events pinned to one partition, giving you the
+    throughput of a single machine), or too few messages have been sent for the
+    sticky partitioner to have cycled through all of them yet.
+    """
+    response = _request(args, API_METADATA, {'topics': [args.topic]})
+    topic = response['topics'][0]
+
+    if topic['error_code'] != 0:
+        print(f"{args.topic}: "
+              f"{ERROR_NAMES.get(topic['error_code'], topic['error_code'])}",
+              file=sys.stderr)
+        return 1
+
+    partitions = topic['partitions']
+    counts = [p['high_watermark'] - p['log_start_offset'] for p in partitions]
+    total = sum(counts)
+    widest = max(counts) if counts else 0
+
+    print(f"Topic      : {args.topic}")
+    print(f"Partitions : {len(partitions)}")
+    print(f"Messages   : {total:,}\n")
+
+    print(f"  {'PART':<6}{'LEADER':<8}{'START':>9}{'END':>9}{'MESSAGES':>10}  SPREAD")
+    for part, count in zip(partitions, counts):
+        bar = '█' * int(count / widest * 32) if widest else ''
+        print(f"  {part['partition']:<6}{part['leader']:<8}"
+              f"{part['log_start_offset']:>9}{part['high_watermark']:>9}"
+              f"{count:>10}  {bar}")
+
+    if total and len(partitions) > 1:
+        ideal = total / len(partitions)
+        skew = (max(counts) / ideal) if ideal else 0
+        print(f"\n  ideal per partition: {ideal:,.0f}    "
+              f"worst partition is {skew:.2f}x that")
     return 0
 
 
@@ -344,6 +422,24 @@ def main() -> int:
     parser.add_argument('--offset-dir', default=DEFAULT_OFFSET_DIR)
 
     sub = parser.add_subparsers(dest='command', required=True)
+
+    # `kfk topics <verb>` — a nested subcommand group, matching real Kafka's
+    # kafka-topics.sh. Kept separate from `describe`, which is about ONE
+    # partition's storage rather than a topic's shape.
+    topics = sub.add_parser('topics', help='create, list and describe topics')
+    topics_sub = topics.add_subparsers(dest='topics_command', required=True)
+
+    t = topics_sub.add_parser('create', help='create a topic')
+    t.add_argument('--topic', required=True)
+    t.add_argument('--partitions', type=int, default=1)
+    t.set_defaults(func=cmd_topics_create)
+
+    t = topics_sub.add_parser('list', help='list all topics')
+    t.set_defaults(func=cmd_topics_list)
+
+    t = topics_sub.add_parser('describe', help='per-partition message spread')
+    t.add_argument('--topic', required=True)
+    t.set_defaults(func=cmd_topics_describe)
 
     p = sub.add_parser('metadata', help='cluster + topic overview (asks the broker)')
     p.add_argument('--topic', default=None, help='limit to one topic')

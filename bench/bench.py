@@ -48,6 +48,7 @@ import time
 from broker.broker import Broker
 from common.net import SyncConnection
 from common.protocol import API_FETCH, API_METADATA, API_PRODUCE
+from producer.producer import Producer
 
 
 def percentile(sorted_values: list, fraction: float) -> float:
@@ -222,6 +223,43 @@ def bench_consume(port: int, topic: str, count: int, batch: int) -> tuple:
     return elapsed, latencies, received
 
 
+def bench_produce_batched(port: int, topic: str, count: int, value: str,
+                          linger_ms: float = 5.0, partitions_hint: int = 1) -> tuple:
+    """
+    Produce through the real batching producer.
+
+    **THE Phase 3 measurement.** Phase 1 showed that ~215 us of every 253 us
+    produce was broker work — a thread hop, a file write, a flush, a JSON
+    decode — paid once per message because one request carried one message.
+    Pipelining could not touch it, because the broker was never idle.
+
+    Batching is the only thing that can: put 200 messages in one request and
+    that per-request cost is paid once for all of them instead of 200 times.
+
+    Uses `send()` + `flush()`, not `send_and_wait()`. The latter waits for each
+    message's reply, which defeats batching entirely — it is the Phase 2
+    behaviour with extra steps, and measuring it here would report the wrong
+    number confidently.
+    """
+    latencies = []
+    started = time.perf_counter()
+
+    with Producer('127.0.0.1', port, topic, quiet=True,
+                  linger_ms=linger_ms, batch_size=16384) as producer:
+        futures = []
+        for _ in range(count):
+            t0 = time.perf_counter()
+            futures.append(producer.send(value))
+            # Time only the CALLER's cost. With batching, send() returns
+            # without sending, so this measures how long the application is
+            # blocked — which is the thing an application actually feels.
+            latencies.append((time.perf_counter() - t0) * 1000)
+        producer.flush()
+
+    elapsed = time.perf_counter() - started
+    return elapsed, latencies
+
+
 def bench_seek_profile(port: int, topic: str, count: int, samples: int = 9) -> list:
     """
     Time a fetch from evenly spaced points through the log.
@@ -319,6 +357,15 @@ def main() -> None:
 
         speedup = (p_elapsed / q_elapsed) if q_elapsed else 0
         print(f"\n    → pipelining is {speedup:.2f}x on identical work")
+
+        b_elapsed, b_latencies = bench_produce_batched(
+            broker.port, topic + '-batched', args.count, value)
+        print(format_row('PRODUCE batched (linger_ms=5, batch_size=16KB)',
+                         args.count, b_elapsed, args.size, summarise(b_latencies)))
+        batch_speedup = (p_elapsed / b_elapsed) if b_elapsed else 0
+        print(f"\n    → batching is {batch_speedup:.1f}x faster than sequential"
+              f"\n      (latency shown is the CALLER's cost — send() returns "
+              f"without sending)")
 
         produce_us = p_elapsed / args.count * 1e6
         work_us = max(produce_us - rtt_us, 1.0)
