@@ -125,6 +125,8 @@ API_FETCH = 1
 API_LIST_OFFSETS = 2
 API_METADATA = 3
 
+API_CREATE_TOPICS = 19         # implemented in Phase 3
+
 # Reserved — defined so the numbers are claimed, not yet implemented.
 API_OFFSET_COMMIT = 8          # Phase 4
 API_OFFSET_FETCH = 9           # Phase 4
@@ -133,7 +135,6 @@ API_JOIN_GROUP = 11            # Phase 4
 API_HEARTBEAT = 12             # Phase 4
 API_LEAVE_GROUP = 13           # Phase 4
 API_SYNC_GROUP = 14            # Phase 4
-API_CREATE_TOPICS = 19         # Phase 3
 
 API_NAMES = {
     API_PRODUCE: 'PRODUCE',
@@ -157,10 +158,19 @@ API_NAMES = {
 # redesign. An api_key absent from this table is unimplemented; a version
 # outside its range gets UNSUPPORTED_VERSION.
 SUPPORTED_VERSIONS = {
-    API_PRODUCE: (0, 0),
+    # PRODUCE v0 = one record, one partition (Phase 1).
+    # PRODUCE v1 = many records across many partitions, with a per-partition
+    #              error code (Phase 3).
+    #
+    # BOTH are served. That is not compatibility theatre — it is the entire
+    # point of per-API versioning, demonstrated: a broker that speaks the old
+    # and new version at once is what lets a ten-broker cluster upgrade one
+    # node at a time while old clients keep working.
+    API_PRODUCE: (0, 1),
     API_FETCH: (0, 0),
     API_LIST_OFFSETS: (0, 0),
     API_METADATA: (0, 0),
+    API_CREATE_TOPICS: (0, 0),
 }
 
 # ── LIST_OFFSETS timestamp sentinels (Kafka's real values) ─────

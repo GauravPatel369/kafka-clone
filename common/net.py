@@ -155,8 +155,19 @@ class SyncConnection:
             reply = conn.request(API_PRODUCE, {'topic': 'orders', ...})
 
     "Sync" names a real property rather than leaving it to be discovered: each
-    `request()` blocks for a full round trip. `pipeline()` is the escape
-    hatch, and Phase 3 adds a genuinely asynchronous client.
+    `request()` blocks for a full round trip. `pipeline()` is the escape hatch.
+
+    **NOT THREAD-SAFE, and the failure is nasty.** A request and its response
+    are a pair, and that pair is not atomic. Two threads sharing one connection
+    will eventually read each other's replies, after which the stream is
+    permanently desynchronised — the next read starts mid-message and
+    interprets body bytes as a header, giving "Bad magic 0x7b226572"
+    (`{"er`...), an error a long way from its cause.
+
+    Callers that share a connection across threads must serialise the whole
+    request/response pair themselves; `producer.Producer` holds a lock for
+    exactly this reason, since its sender thread and its caller threads both
+    use one socket.
     """
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,

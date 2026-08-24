@@ -1,94 +1,169 @@
 """
-CONCEPT: The Producer — the Write Side
+CONCEPT: The Producer — the Write Side, and the Load Balancer
+----------------------------------------------------------------
+The producer creates messages, decides which partition each one belongs to,
+batches them, and ships them to the broker.
+
+That second job is the important one. **There is no load balancer in front of a
+Kafka cluster** — the producer holds cluster metadata and routes each message
+itself. This is what makes Kafka clients "thick", and it is why `METADATA` and
+`NOT_LEADER_OR_FOLLOWER` were built back in Phase 1.
+
+    producer.send('order placed', key='cust-42')
+        │
+        ├─ metadata: topic 'orders' has 4 partitions
+        ├─ partitioner: murmur2('cust-42') % 4 → partition 3
+        ├─ accumulator: buffer it in partition 3's batch
+        └─ returns a Future immediately
+                            ⋮
+        sender thread: batch full (or linger_ms elapsed) → one request
+
+
+THREE THINGS CHANGED IN PHASE 3
+---------------------------------
+**1. `send()` is asynchronous.** It returns a `FutureRecordMetadata`, not an
+offset. This is forced, not stylistic: returning an offset means waiting for
+the reply, and a message that waits for its own reply was never batched with
+anything. Blocking and batching are mutually exclusive. `send_and_wait()`
+exists for the cases where blocking is genuinely what you want.
+
+**2. The key finally does something.** It has been carried and ignored since
+Phase 0. Now `murmur2(key) % num_partitions` routes it — which is what
+guarantees that every event for one customer lands in one partition and is
+therefore strictly ordered.
+
+**3. `acks` is real.** `acks=0` means the broker sends no reply at all, which
+is worth seeing in a protocol that is otherwise strictly request/response.
+
+
+WHAT BATCHING BOUGHT, AND WHAT IT COST
 ----------------------------------------
-The producer creates messages and sends them to a broker.
+The Phase 1 breakdown said 215 us of every 253 us produce was broker work,
+paid once per message. Batching amortises that over a whole batch — the single
+largest win available in the project, and `bench/bench.py` measures it.
 
-    producer.send("order placed", key="user-42")
-        → encode  → TCP → broker → append to log → offset 41
-        ← offset 41 ←──────────────────────────────────────┘
-
-In Phase 0 this is as simple as it gets: one connection, one message per
-request, wait for the acknowledgement before sending the next.
-
-
-THE THING TO NOTICE: THIS DESIGN IS SLOW, AND THAT IS THE LESSON
-------------------------------------------------------------------
-Every `send()` costs a full network round trip, during which the producer
-does nothing at all:
-
-    send msg 1 ──────► broker
-               ◄────── ack           (wait 0.5 ms)
-    send msg 2 ──────► broker
-               ◄────── ack           (wait 0.5 ms)
-
-At 0.5 ms per round trip that caps you at ~2,000 messages/second no matter
-how fast the broker is. The broker is idle most of that time; so is the
-network; so is the producer. The bottleneck is pure latency.
-
-Real producers fix this two ways:
-
-  1. **Pipelining** — send the next request without waiting for the previous
-     acknowledgement, matching replies to requests by correlation ID. Removes
-     the *waiting*. Available now via `send_pipelined()`, because the Phase 1
-     header carries a correlation_id.
-  2. **Batching** — accumulate messages in memory for a few milliseconds
-     (`linger.ms`) and send them as ONE request. Removes the waiting *and* the
-     per-message overhead. Phase 3.
-
-Both are the same insight — **the round trip is the expensive part, so
-amortise it** — applied at different levels. They compose. Compare
-`send_many` (neither) against `send_pipelined` (one of them) in
-`bench/bench.py`; Phase 3 adds the third row.
-
-
-WHAT THE PRODUCER DECIDES
---------------------------
-The producer, not the broker, chooses which partition a message goes to. That
-sounds like a detail; it is actually the load-balancing mechanism of the whole
-system, and it is what Phase 3 is about. `key` is accepted and stored today
-but not yet used for routing — every message goes to partition 0.
+The cost is latency: with `linger_ms=5`, a message sent into an empty batch
+waits up to 5 ms before anyone sees it. You bought throughput with latency, and
+`linger_ms=0` buys it back at the price of most of the throughput. There is no
+setting that is right for everything, which is why it is a setting.
 """
 
 import argparse
+import logging
+import random
+import threading
+import time
 
 from common.config import DEFAULT_HOST, DEFAULT_PORT
-from common.errors import raise_for_error
-from common.net import SyncConnection
-from common.protocol import API_PRODUCE
+from common.errors import KafkaError, RetriableError, error_for_code, raise_for_error
+from common.net import BrokerConnectionError, SyncConnection
+from common.protocol import API_METADATA, API_PRODUCE
+from producer.batch import RecordAccumulator, Sender
+from producer.partitioner import DefaultPartitioner
+
+log = logging.getLogger(__name__)
+
+# PRODUCE v1 carries batches for several partitions with per-partition error
+# codes. v0 (one record, one partition) still works — see the Phase 1 notes on
+# why per-API versioning is what makes a rolling upgrade possible.
+PRODUCE_VERSION_BATCHED = 1
 
 
 class Producer:
     """
-    A synchronous producer bound to one topic and one broker.
-
-    Use as a context manager so the connection is always closed:
+    An asynchronous, batching, partition-aware producer.
 
         with Producer(topic='orders') as p:
-            p.send('hello')
+            p.send('order placed', key='cust-42')
+            p.send('order shipped', key='cust-42')   # same partition, ordered
+            p.flush()
     """
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
-                 topic: str = 'default', quiet: bool = False):
+                 topic: str = 'default', quiet: bool = False,
+                 acks: int = 1,
+                 batch_size: int = 16384,
+                 linger_ms: float = 5.0,
+                 retries: int = 3,
+                 retry_backoff_ms: float = 100.0,
+                 max_backoff_ms: float = 5000.0,
+                 sticky: bool = True):
         self.host = host
         self.port = port
         self.topic = topic
-
-        # `quiet` exists for the benchmark. Printing a line per message costs
-        # more than the message does — without this, bench/bench.py would be
-        # measuring the speed of your terminal. Any measurement harness needs
-        # a way to silence the thing it is measuring.
         self.quiet = quiet
+
+        # 0   = fire and forget; the broker sends NO reply
+        # 1   = the leader has it in its log
+        # all = every in-sync replica has it (identical to 1 until Phase 6)
+        self.acks = acks
+
+        self.retries = retries
+        self.retry_backoff_ms = retry_backoff_ms
+        self.max_backoff_ms = max_backoff_ms
 
         self._conn = SyncConnection(host, port)
 
-    # ── Connection lifecycle ───────────────────────────────────
+        # CONCEPT: one socket, two threads — and why this lock is mandatory.
+        #
+        # The SENDER thread uses the connection for PRODUCE. A CALLER thread
+        # uses it for METADATA, inside send(), when it needs a partition count.
+        # A SyncConnection is a request followed by a matching response, and
+        # that pair is NOT atomic:
+        #
+        #     sender  ──PRODUCE──►
+        #     caller  ──METADATA─►
+        #     sender  ◄──────────── reads the METADATA reply as its own
+        #
+        # After that the stream is permanently desynchronised: the next read
+        # starts mid-message and interprets body bytes as a header. The symptom
+        # is "Bad magic 0x7b226572" — which is `{"er`, the beginning of a JSON
+        # body. A confusing error a long way from its cause.
+        #
+        # This bug is invisible in single-threaded tests and appeared the
+        # moment Phase 3 added a background sender. Correlation IDs would let
+        # a smarter client demultiplex the replies; a lock is the honest
+        # simple answer, and metadata lookups are cached so it is rarely
+        # contended.
+        self._conn_lock = threading.Lock()
+
+        self._partitioner = DefaultPartitioner(sticky=sticky)
+        self._accumulator = RecordAccumulator(batch_size=batch_size,
+                                              linger_ms=linger_ms)
+        self._sender = None
+
+        # Cached partition counts, refreshed from METADATA on first use of a
+        # topic. A producer that asked the broker how many partitions a topic
+        # has before EVERY message would spend more time asking than sending —
+        # this cache is the same idea as a client's metadata cache in real
+        # Kafka, and it goes stale for the same reasons.
+        self._partition_counts = {}
+
+    # ── Lifecycle ──────────────────────────────────────────────
 
     def connect(self) -> 'Producer':
         self._conn.connect()
-        self._log(f"Connected to broker at {self.host}:{self.port}")
+        self._sender = Sender(self._accumulator, self._send_batches)
+        self._sender.start()
+        self._log(f"connected to broker at {self.host}:{self.port} "
+                  f"(acks={self.acks})")
         return self
 
     def close(self) -> None:
+        """
+        Flush everything buffered, stop the sender, close the socket.
+
+        The order matters. Stopping the sender first would strand whatever is
+        still in the accumulator, and those futures would never resolve —
+        callers waiting on them would hang until their timeout with no
+        explanation of why.
+        """
+        if self._sender is not None:
+            try:
+                self._sender.flush()
+            finally:
+                self._sender.stop()
+                self._sender = None
         self._conn.close()
 
     def __enter__(self) -> 'Producer':
@@ -99,117 +174,237 @@ class Producer:
 
     # ── Sending ────────────────────────────────────────────────
 
-    def send(self, value: str, key: str = None, partition: int = 0) -> int:
+    def send(self, value: str, key: str = None, partition: int = None,
+             topic: str = None):
         """
-        Send one message; block until the broker acknowledges; return the
-        offset it was assigned.
+        Buffer one message. Returns a Future, immediately — nothing is sent yet.
 
         Args:
             value:     the message body.
-            key:       routing key. Stored today, used for partition routing
-                       from Phase 3 — messages with the same key will land in
-                       the same partition, which is how per-key ordering is
-                       guaranteed.
-            partition: explicit target partition. Always 0 until Phase 3.
+            key:       routing key. Same key → same partition → ordered.
+                       None → the sticky partitioner spreads messages.
+            partition: bypass the partitioner entirely. Useful for tests and
+                       for deliberate placement; skips the ordering guarantee
+                       the key would have given you.
+            topic:     override this producer's default topic.
 
-        CONCEPT: The returned offset is a receipt.
-          Getting an offset back means the broker has the message in its log.
-          It does NOT yet mean the message is safe — it is in the OS page
-          cache, not on a platter, and there is only one copy of it.
-
-          Phase 3 makes that explicit with `acks` (0 = do not wait, 1 = leader
-          has it, all = every replica has it) and Phase 6 makes `acks=all`
-          meaningful by adding replicas. Right now every send is effectively
-          `acks=1` against a single copy.
+        The returned Future resolves with the assigned offset once the broker
+        acknowledges. With `acks=0` it resolves with -1 as soon as the bytes
+        are on the wire, because there is no acknowledgement to wait for.
         """
-        response = self._conn.request(API_PRODUCE, self._payload(value, key, partition))
+        topic = topic or self.topic
+        num_partitions = self._num_partitions(topic)
+        target = self._partitioner.partition(topic, key, num_partitions, partition)
 
-        # raise_for_error turns a numeric error_code into the right typed
-        # exception. Every client call routes through it, so error handling
-        # cannot be accidentally skipped at one call site — the most common
-        # way error handling rots.
-        raise_for_error(response, topic=self.topic, partition=partition)
+        future, became_full = self._accumulator.append(topic, target, key, value)
 
-        offset = response['offset']
-        self._log(f"SENT value={value!r} key={key!r} → "
-                  f"{self.topic}-{partition} offset={offset}")
-        return offset
+        if became_full and key is None and partition is None:
+            # The sticky partitioner fills ONE partition's batch, then moves on.
+            # Telling it here — rather than on a timer — is what keeps batches
+            # large while still spreading load evenly over time.
+            self._partitioner.on_batch_full(topic, num_partitions)
 
-    def send_many(self, values, key: str = None, partition: int = 0) -> list:
+        return future
+
+    def send_and_wait(self, value: str, key: str = None,
+                      partition: int = None, topic: str = None,
+                      timeout: float = 30.0) -> int:
         """
-        Send an iterable of values one at a time; return their offsets.
+        Send one message and block for its offset.
 
-        NOT batching, and not pipelining either — a plain loop of individual
-        round trips, with all the cost described in the module docstring. Kept
-        as the honest baseline that `send_pipelined` is measured against.
+        Honestly named: this is `send()` plus a wait, not a different
+        mechanism. Convenient for tests and demos, and it gives up the
+        batching — every call waits out a full round trip, which is exactly the
+        Phase 2 behaviour this phase was built to escape. Use `send()` plus
+        `flush()` when throughput matters.
         """
-        return [self.send(v, key=key, partition=partition) for v in values]
+        future = self.send(value, key=key, partition=partition, topic=topic)
+        self.flush()
+        return future.get(timeout)
 
-    def send_pipelined(self, values, key: str = None, partition: int = 0) -> list:
+    def send_many(self, values, key: str = None, partition: int = None,
+                  topic: str = None) -> list:
         """
-        Send many messages without waiting for each acknowledgement.
+        Send an iterable of values and return their offsets, in order.
 
-        CONCEPT: pipelining — the Phase 1 payoff.
-          `send_many` waits for a reply before sending the next request, so N
-          messages cost N round trips. This puts all N requests on the wire
-          first, then collects the replies, matching them by correlation ID.
-          N messages, one round trip.
-
-          It is only possible because the Phase 1 header carries a
-          correlation_id. Without one the replies would be unmatchable, and
-          waiting would be the only safe design.
-
-        Pipelining is NOT batching, and the difference matters:
-
-            pipelining   N requests in flight at once. Removes the WAITING.
-                         Per-message overhead (a 16-byte header, a JSON
-                         object, a broker dispatch) is unchanged.
-            batching     N messages inside ONE request. Removes the
-                         per-message OVERHEAD as well.
-
-          They compose, and Phase 3 uses both. Batching is the bigger win;
-          pipelining is the one the protocol just unlocked.
-
-        CAVEAT: sending an unbounded number of requests before reading any
-        reply can deadlock — we fill our send buffer while the broker fills
-        its own with replies nobody is draining. Real clients cap in-flight
-        requests (`max.in.flight.requests.per.connection`) for this reason.
-        Keep batches to a few hundred.
+        Now genuinely batched: every message is buffered first, then one
+        `flush()` ships them together. Through Phase 2 this was a loop of
+        individual round trips.
         """
-        values = list(values)
-        if not values:
-            return []
+        futures = [self.send(v, key=key, partition=partition, topic=topic)
+                   for v in values]
+        self.flush()
+        return [f.get() for f in futures]
 
-        responses = self._conn.pipeline([
-            (API_PRODUCE, self._payload(value, key, partition)) for value in values
-        ])
+    def flush(self, timeout: float = 30.0) -> None:
+        """Send everything buffered and wait for it to be acknowledged."""
+        if self._sender is not None:
+            self._sender.flush(timeout)
 
-        offsets = []
-        for response in responses:
-            raise_for_error(response, topic=self.topic, partition=partition)
-            offsets.append(response['offset'])
+    # ── The send path (sender thread) ──────────────────────────
 
-        self._log(f"SENT {len(offsets)} messages pipelined → "
-                  f"{self.topic}-{partition} offsets "
-                  f"{offsets[0]}..{offsets[-1]}")
-        return offsets
+    def _send_batches(self, batches: list) -> None:
+        """
+        Ship drained batches. Called on the sender thread, never by callers.
+
+        Batches are grouped by topic so that several partitions travel in ONE
+        request — which is what PRODUCE v1's per-partition structure exists
+        for, and why its errors are per-partition too.
+        """
+        by_topic = {}
+        for batch in batches:
+            by_topic.setdefault(batch.topic, []).append(batch)
+
+        for topic, topic_batches in by_topic.items():
+            try:
+                self._send_topic_batches(topic, topic_batches)
+            except Exception as exc:
+                for batch in topic_batches:
+                    batch.fail(exc)
+
+    def _send_topic_batches(self, topic: str, batches: list) -> None:
+        payload = {
+            'topic': topic,
+            'acks': self.acks,
+            'partitions': [
+                {'partition': batch.partition, 'records': batch.records}
+                for batch in batches
+            ],
+        }
+
+        response = self._request_with_retries(payload)
+
+        if response is None:
+            # acks=0: no reply exists, so there is no offset to report and no
+            # error to detect. THAT IS THE SEMANTIC, not an oversight — you
+            # asked not to be told.
+            for batch in batches:
+                batch.complete(-1)
+            return
+
+        raise_for_error(response, topic=topic)
+
+        results = {entry['partition']: entry
+                   for entry in response.get('partitions', [])}
+
+        for batch in batches:
+            entry = results.get(batch.partition)
+            if entry is None:
+                batch.fail(KafkaError(
+                    f"broker did not report partition {batch.partition}"))
+            elif entry.get('error_code', 0) != 0:
+                # Per-partition errors are why v1 exists: one bad partition
+                # must not fail the nine that succeeded.
+                batch.fail(error_for_code(entry['error_code'],
+                                          entry.get('error_message', ''),
+                                          topic=topic, partition=batch.partition))
+            else:
+                batch.complete(entry['base_offset'])
+
+    def _request_with_retries(self, payload: dict):
+        """
+        Send one PRODUCE request, retrying retriable failures.
+
+        CONCEPT: exponential backoff WITH JITTER.
+          Doubling the delay stops a struggling broker being hammered. The
+          jitter is the part people leave out, and it matters: without it,
+          every producer that failed at the same instant retries at the same
+          instant, and the broker that just came back is knocked over by a
+          synchronised thundering herd. Randomising spreads them out.
+
+        Only RetriableError and connection failures are retried. Retrying an
+        INVALID_REQUEST would resend identical bad bytes forever — which is
+        exactly the distinction the Phase 1 error taxonomy was built to make,
+        and why it is `except RetriableError` here rather than a string match.
+        """
+        attempt = 0
+        while True:
+            try:
+                # The lock must cover the request AND its response as one unit
+                # — that pair is what another thread must not interleave with.
+                with self._conn_lock:
+                    if self.acks == 0:
+                        # No reply is coming, so do not read one. The
+                        # connection stays in sync because the broker
+                        # genuinely sends nothing back.
+                        self._conn.send_request(API_PRODUCE, payload,
+                                                PRODUCE_VERSION_BATCHED)
+                        return None
+                    return self._conn.request(API_PRODUCE, payload,
+                                              PRODUCE_VERSION_BATCHED)
+
+            except (RetriableError, BrokerConnectionError) as exc:
+                if attempt >= self.retries:
+                    raise
+                delay = min(self.retry_backoff_ms * (2 ** attempt),
+                            self.max_backoff_ms)
+                delay *= 0.5 + random.random()        # jitter
+                self._log(f"retriable failure ({exc}); retry "
+                          f"{attempt + 1}/{self.retries} in {delay:.0f}ms")
+                time.sleep(delay / 1000.0)
+                attempt += 1
+
+                if isinstance(exc, BrokerConnectionError):
+                    # The socket is gone; a retry on it would fail identically.
+                    with self._conn_lock:
+                        self._conn.close()
+                        self._conn.connect()
+
+    # ── Metadata ───────────────────────────────────────────────
+
+    def _num_partitions(self, topic: str) -> int:
+        """
+        How many partitions this topic has, cached after the first lookup.
+
+        The cache is why a producer can route a message without a network round
+        trip. It is also why a client can be WRONG after a topic changes —
+        which is the general shape of every metadata cache, and the reason
+        Phase 5's failover works by invalidating this on an error rather than
+        by polling.
+        """
+        cached = self._partition_counts.get(topic)
+        if cached is not None:
+            return cached
+
+        # `allow_auto_topic_creation` matters more than it looks. Without it,
+        # a brand-new topic answers "does not exist", we fall back to 1, and
+        # every keyed message goes to partition 0 — then the first PRODUCE
+        # auto-creates the topic at its real width and our cached 1 is wrong.
+        # Asking metadata to create it first means the count we cache is the
+        # real one. Real Kafka producers set exactly this flag.
+        with self._conn_lock:
+            response = self._conn.request(
+                API_METADATA,
+                {'topics': [topic], 'allow_auto_topic_creation': True})
+        raise_for_error(response, topic=topic)
+
+        for entry in response.get('topics', []):
+            if entry['name'] == topic and entry.get('error_code', 0) == 0:
+                count = len(entry['partitions'])
+                if count:
+                    self._partition_counts[topic] = count
+                    return count
+
+        # The topic genuinely does not exist and auto-creation is off on the
+        # broker. Assume one partition rather than failing here: the PRODUCE
+        # will return a proper UNKNOWN_TOPIC_OR_PARTITION, which is a much
+        # better error than one raised from a metadata lookup the caller did
+        # not know was happening.
+        return 1
+
+    def refresh_metadata(self) -> None:
+        """Drop the cache so the next send re-reads partition counts."""
+        self._partition_counts.clear()
 
     # ── Internals ──────────────────────────────────────────────
-
-    def _payload(self, value: str, key, partition: int) -> dict:
-        return {
-            'topic':     self.topic,
-            'partition': partition,
-            'value':     value,
-            'key':       key,
-        }
 
     def _log(self, message: str) -> None:
         if not self.quiet:
             print(f"[Producer] {message}")
 
     def __repr__(self) -> str:
-        return f"Producer(topic={self.topic!r}, broker={self.host}:{self.port})"
+        return (f"Producer(topic={self.topic!r}, broker={self.host}:{self.port}, "
+                f"acks={self.acks})")
 
 
 # ── Entry point ────────────────────────────────────────────────
@@ -220,18 +415,41 @@ def main() -> None:
     parser.add_argument('--host', default=DEFAULT_HOST)
     parser.add_argument('--port', type=int, default=DEFAULT_PORT)
     parser.add_argument('--topic', default='orders')
-    parser.add_argument('--count', type=int, default=5,
-                        help='How many test messages to send')
-    parser.add_argument('--prefix', default='message',
-                        help='Text prefix for generated messages')
+    parser.add_argument('--count', type=int, default=5)
+    parser.add_argument('--prefix', default='message')
+    parser.add_argument('--keys', type=int, default=3,
+                        help='Distinct keys to cycle through; 0 for keyless')
+    parser.add_argument('--acks', default='1', choices=['0', '1', 'all'])
+    parser.add_argument('--linger-ms', type=float, default=5.0)
     parser.add_argument('--quiet', action='store_true')
     args = parser.parse_args()
 
-    with Producer(args.host, args.port, args.topic, quiet=args.quiet) as producer:
-        for i in range(args.count):
-            producer.send(f"{args.prefix}-{i}", key=f"key-{i % 3}")
+    acks = 0 if args.acks == '0' else (1 if args.acks == '1' else 'all')
 
-    print(f"\nDone. Sent {args.count} messages to topic {args.topic!r}.")
+    started = time.perf_counter()
+    with Producer(args.host, args.port, args.topic, quiet=args.quiet,
+                  acks=acks, linger_ms=args.linger_ms) as producer:
+        futures = [
+            producer.send(f"{args.prefix}-{i}",
+                          key=f"key-{i % args.keys}" if args.keys else None)
+            for i in range(args.count)
+        ]
+        producer.flush()
+
+    elapsed = time.perf_counter() - started
+
+    if acks == 0:
+        print(f"\nSent {args.count} messages to {args.topic!r} with acks=0 "
+              f"in {elapsed:.2f}s.\nNo offsets: with acks=0 the broker sends no "
+              f"reply, so success is unverifiable by design.")
+    else:
+        spread = {}
+        for future in futures:
+            spread[future.partition] = spread.get(future.partition, 0) + 1
+        print(f"\nSent {args.count} messages to {args.topic!r} in {elapsed:.2f}s "
+              f"({args.count / elapsed:,.0f} msg/sec).")
+        print("Partition spread:  " +
+              "  ".join(f"p{p}={n}" for p, n in sorted(spread.items())))
 
 
 if __name__ == '__main__':
