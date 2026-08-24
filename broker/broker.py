@@ -73,13 +73,14 @@ import os
 import threading
 
 from broker.log import LogConfig
+from broker.metadata import InvalidTopicError, MetadataStore
 from broker.partition import Partition
 from common import errors
 from common.config import (
     DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_RETENTION_CHECK_MS,
 )
 from common.protocol import (
-    API_FETCH, API_LIST_OFFSETS, API_METADATA, API_PRODUCE,
+    API_CREATE_TOPICS, API_FETCH, API_LIST_OFFSETS, API_METADATA, API_PRODUCE,
     HEADER_SIZE, MAGIC, MAX_REQUEST_BYTES,
     TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
     api_name, decode_body, decode_header, encode_message, is_supported,
@@ -92,10 +93,19 @@ class Broker:
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  data_dir: str = DEFAULT_DATA_DIR, node_id: int = 0,
                  log_config: LogConfig = None,
-                 retention_check_ms: float = DEFAULT_RETENTION_CHECK_MS):
+                 retention_check_ms: float = DEFAULT_RETENTION_CHECK_MS,
+                 auto_create_topics: bool = True,
+                 default_partitions: int = 1):
         self.host = host
         self.port = port          # rewritten with the real port if port == 0
         self.data_dir = data_dir
+
+        # Which topics exist and how many partitions each has. A partition
+        # count has to be DECLARED rather than inferred from which directories
+        # happen to exist, because the producer needs it to route a message
+        # before any of those partitions contain anything.
+        self.metadata = MetadataStore(data_dir, auto_create=auto_create_topics,
+                                      default_partitions=default_partitions)
 
         # Storage tuning applied to every partition this broker creates.
         # Real Kafka allows per-topic overrides; we have no topic metadata to
@@ -211,7 +221,14 @@ class Broker:
                 f"{api_name(api_key)} v{api_version} is not supported by this broker")
 
         if api_key == API_PRODUCE:
+            # The one place a version actually branches. v0 is Phase 1's
+            # single-record shape; v1 is Phase 3's batched, multi-partition
+            # shape. Serving both is what a rolling upgrade looks like.
+            if api_version >= 1:
+                return await self._handle_produce_v1(payload)
             return await self._handle_produce(payload)
+        if api_key == API_CREATE_TOPICS:
+            return await self._handle_create_topics(payload)
         if api_key == API_FETCH:
             return await self._handle_fetch(payload)
         if api_key == API_LIST_OFFSETS:
@@ -223,7 +240,116 @@ class Broker:
         # belt-and-braces guard, because "unreachable" and "unreached" differ.
         return _error(errors.INVALID_REQUEST, f"unhandled api_key {api_key}")
 
+    async def _handle_create_topics(self, payload: dict) -> dict:
+        """
+        Create a topic explicitly, with a chosen partition count.
+
+        CONCEPT: why this API had to exist.
+          Auto-creation always makes ONE partition, because a lazily-created
+          topic has nobody to ask how wide it should be. So relying on it does
+          not merely risk a typo — it silently costs you all the parallelism
+          that Phase 3 was built to provide.
+
+          Real Kafka calls the flag `auto.create.topics.enable`, and most
+          production clusters turn it off for exactly these two reasons.
+        """
+        name = payload.get('topic')
+        partitions = payload.get('partitions')
+        replication_factor = payload.get('replication_factor', 1)
+
+        if not name:
+            return _error(errors.INVALID_REQUEST, "'topic' is required")
+
+        try:
+            config = self.metadata.create_topic(name, partitions, replication_factor)
+        except InvalidTopicError as exc:
+            return _error(errors.INVALID_REQUEST, str(exc))
+
+        log.info("Created topic %s with %d partition(s)", name, config.partitions)
+        return {
+            'error_code': errors.NONE,
+            'topic': name,
+            'partitions': config.partitions,
+            'replication_factor': config.replication_factor,
+        }
+
+    async def _handle_produce_v1(self, payload: dict) -> dict:
+        """
+        Batched produce: many records, across many partitions, in one request.
+
+        CONCEPT: per-partition error codes.
+          One request now touches several partitions, so one top-level error
+          code cannot describe the outcome. If partition 3 is out of range,
+          partitions 0 and 1 must still succeed and say so — otherwise a single
+          bad partition fails a batch of nine good ones and the client cannot
+          tell which to resend.
+
+          This is the shape Phase 1's Exercise 7 asked you to design, and it is
+          why the error taxonomy put codes in the BODY rather than the header.
+
+        `base_offset` is returned once per partition rather than once per
+        record: offsets within a batch are contiguous, so the client resolves
+        record i as `base_offset + i`. Saving n-1 integers per batch is a small
+        thing on its own and exactly the kind of saving that makes batching
+        cheaper than the sum of its parts.
+        """
+        topic = payload.get('topic')
+        acks = payload.get('acks', 1)
+        partitions = payload.get('partitions', [])
+
+        if not topic:
+            return _error(errors.INVALID_REQUEST, "'topic' is required")
+        if not isinstance(partitions, list):
+            return _error(errors.INVALID_REQUEST, "'partitions' must be a list")
+
+        try:
+            self.metadata.get_or_create(topic)
+        except errors.KafkaError as exc:
+            return _error(exc.error_code, str(exc))
+
+        results = []
+        total = 0
+
+        for entry in partitions:
+            part_id = entry.get('partition', 0)
+            records = entry.get('records', [])
+
+            try:
+                self.metadata.validate_partition(topic, part_id)
+            except errors.KafkaError as exc:
+                # Per-partition, so the others in this request still proceed.
+                results.append({'partition': part_id,
+                                'error_code': exc.error_code,
+                                'error_message': str(exc),
+                                'base_offset': -1, 'count': 0})
+                continue
+
+            if not records:
+                results.append({'partition': part_id, 'error_code': errors.NONE,
+                                'base_offset': -1, 'count': 0})
+                continue
+
+            partition = self._get_partition(topic, part_id)
+            base_offset = await self._run_blocking(
+                _append_records, partition, records)
+
+            results.append({'partition': part_id, 'error_code': errors.NONE,
+                            'base_offset': base_offset, 'count': len(records)})
+            total += len(records)
+
+        log.info("PRODUCE v1 → %s: %d records across %d partition(s), acks=%s",
+                 topic, total, len(partitions), acks)
+
+        # acks=0 means the client is not reading a reply, so this response is
+        # written into a socket nobody will drain. Returning None tells
+        # handle_client to send nothing at all — see the note there.
+        if acks == 0:
+            return None
+
+        return {'error_code': errors.NONE, 'topic': topic, 'partitions': results}
+
     async def _handle_produce(self, payload: dict) -> dict:
+        """PRODUCE v0 — one record, one partition. Phase 1's shape, still served."""
         topic = payload.get('topic')
         part_id = payload.get('partition', 0)
         value = payload.get('value', '')
@@ -231,6 +357,12 @@ class Broker:
 
         if not topic:
             return _error(errors.INVALID_REQUEST, "'topic' is required")
+
+        try:
+            self.metadata.get_or_create(topic)
+            self.metadata.validate_partition(topic, part_id)
+        except errors.KafkaError as exc:
+            return _error(exc.error_code, str(exc))
 
         partition = self._get_partition(topic, part_id)
         offset = await self._run_blocking(partition.append, value, key)
@@ -358,40 +490,63 @@ class Broker:
         """
         requested = payload.get('topics')
 
-        with self._registry_lock:
-            by_topic = {}
-            for (topic, part_id), partition in self.partitions.items():
-                by_topic.setdefault(topic, []).append((part_id, partition))
+        # CONCEPT: a metadata request can CREATE a topic, and it has to.
+        #
+        # A producer must know the partition count before it can route its
+        # first message — `murmur2(key) % count` needs the count. But for a
+        # brand-new topic, asking produces "does not exist", the client assumes
+        # 1, and every keyed message goes to partition 0. The topic is then
+        # auto-created with its real width on the first PRODUCE, and the
+        # producer's cached 1 is now wrong.
+        #
+        # The fix is the one real Kafka uses: the client asks metadata to
+        # create the topic if needed, so the answer it caches is the real one.
+        # Off by default, because a plain query must NOT conjure the thing it
+        # is asking about — that would make "does this exist?" unanswerable.
+        if requested and payload.get('allow_auto_topic_creation') \
+                and self.metadata.auto_create:
+            for name in requested:
+                try:
+                    self.metadata.get_or_create(name)
+                except (errors.KafkaError, InvalidTopicError):
+                    pass        # reported per topic below, as usual
 
-        if requested:
-            missing = [t for t in requested if t not in by_topic]
-            by_topic = {t: p for t, p in by_topic.items() if t in requested}
-        else:
-            missing = []
+        # Partition lists now come from the METADATA STORE, not from which
+        # directories happen to exist. That distinction is the whole reason
+        # Phase 3 needed a metadata store: a 4-partition topic must report four
+        # partitions the moment it is created, before any of them hold data —
+        # otherwise a producer asking "how wide is this topic?" would get an
+        # answer that grows as messages arrive, and key routing would change
+        # underneath it.
+        names = requested if requested else self.metadata.list_topics()
+        missing = [name for name in names if not self.metadata.exists(name)]
 
-        topics = [
-            {
-                'name': topic,
-                'error_code': errors.NONE,
-                'partitions': [
-                    {
-                        'partition': part_id,
-                        # With one broker, every partition is led by us and has
-                        # exactly one replica, which is trivially in-sync.
-                        # Phase 5 assigns real leaders; Phase 6 real replicas
-                        # and a real ISR. The SHAPE is right now, so clients
-                        # written against it keep working.
-                        'leader': self.node_id,
-                        'replicas': [self.node_id],
-                        'isr': [self.node_id],
-                        'high_watermark': partition.next_offset,
-                        'log_start_offset': partition.log_start_offset,
-                    }
-                    for part_id, partition in sorted(parts, key=lambda p: p[0])
-                ],
-            }
-            for topic, parts in sorted(by_topic.items())
-        ]
+        topics = []
+        for name in sorted(n for n in names if self.metadata.exists(n)):
+            config = self.metadata.get(name)
+            partition_entries = []
+
+            for part_id in config.partition_ids():
+                partition = self._find_partition(name, part_id)
+                partition_entries.append({
+                    'partition': part_id,
+                    # With one broker, every partition is led by us and has
+                    # exactly one replica, which is trivially in-sync. Phase 5
+                    # assigns real leaders; Phase 6 real replicas and a real
+                    # ISR. The SHAPE is right now, so clients written against
+                    # it keep working.
+                    'leader': self.node_id,
+                    'replicas': [self.node_id],
+                    'isr': [self.node_id],
+                    # A declared-but-never-written partition has no log yet.
+                    # It is still a real partition — reporting 0/0 is honest,
+                    # and omitting it would under-report the topic's width.
+                    'high_watermark': partition.next_offset if partition else 0,
+                    'log_start_offset': partition.log_start_offset if partition else 0,
+                })
+
+            topics.append({'name': name, 'error_code': errors.NONE,
+                           'partitions': partition_entries})
 
         # A topic that was asked for but does not exist is reported per topic,
         # not as a failure of the whole request — one unknown name must not
@@ -503,7 +658,14 @@ class Broker:
                                       "internal broker error")
 
                 # Step 6: answer, echoing api_key and correlation_id.
-                await _reply(writer, header, response)
+                #
+                # A None response means acks=0: the client is not going to read
+                # a reply, so writing one would leave bytes in the socket that
+                # the NEXT response gets read as. Sending nothing is what keeps
+                # the stream in sync — and it is the one case where this
+                # otherwise strictly request/response protocol has no response.
+                if response is not None:
+                    await _reply(writer, header, response)
 
         except (ConnectionResetError, BrokenPipeError):
             # The client died or the network dropped. Extremely normal; not
@@ -619,6 +781,26 @@ class Broker:
 
 
 # ── Response helpers ───────────────────────────────────────────
+
+def _append_records(partition, records: list) -> int:
+    """
+    Append a batch and return the offset of its FIRST record.
+
+    Runs on an executor thread. Kept as a module function rather than a lambda
+    so `run_in_executor` gets something picklable-shaped and readable in a
+    traceback.
+
+    The records are appended one at a time under the partition's lock, so their
+    offsets are contiguous — which is what lets the client resolve record i as
+    `base_offset + i` from a single returned integer.
+    """
+    base_offset = -1
+    for record in records:
+        offset = partition.append(record.get('value', ''), record.get('key'))
+        if base_offset < 0:
+            base_offset = offset
+    return base_offset
+
 
 def _error(error_code: int, message: str) -> dict:
     """
