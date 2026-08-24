@@ -33,6 +33,11 @@ Preparing to be asked about this? **[docs/interview-questions.md](docs/interview
 maps every concept here to the questions it gets asked as, with the measured
 numbers from this repo to answer them with.
 
+Want the wrong turns rather than the clean result?
+**[docs/challenges-and-solutions.md](docs/challenges-and-solutions.md)** is the
+development journal: fifteen real bugs, wrong predictions, and design dead
+ends — what broke, how it was caught, and what fixed it.
+
 ---
 
 ## Quick start
@@ -43,14 +48,16 @@ pip install -r requirements.txt
 # Terminal 1 — the broker
 python -m broker.broker
 
-# Terminal 2 — send some messages
-python -m producer.producer --topic orders --count 20
+# Terminal 2 — create a 4-partition topic and produce to it
+python -m tools.kfk topics create --topic orders --partitions 4
+python -m producer.producer --topic orders --count 2000
 
-# Terminal 3 — read them back
-python -m consumer.consumer --topic orders --group demo
+# Terminal 3 — read one partition back
+python -m consumer.consumer --topic orders --partition 0 --group demo
 
 # Look at what happened
-python -m tools.kfk describe --topic orders
+python -m tools.kfk topics describe --topic orders   # per-partition spread
+python -m tools.kfk segments --topic orders
 python -m tools.kfk tail     --topic orders --count 5
 ```
 
@@ -63,6 +70,7 @@ python -m tools.kfk tail     --topic orders --count 5
 ```bash
 python -m chaos.kill_consumer_midprocess   # watch at-most-once lose data
 python -m chaos.corrupt_log                # watch CRCs catch three kinds of damage
+python -m chaos.partition_balance          # watch load balancing and its cost
 python -m bench.bench --count 20000        # throughput, percentiles, seek profile
 pytest -q                                  # the test suite
 ```
@@ -124,8 +132,8 @@ clients decide what to retry without parsing English.
 | **0** | [Foundation](docs/phase-0/phase-0-foundation.md) | Tests, benchmarks, chaos scripts, admin CLI; four bug fixes | ✅ done |
 | **1** | [Protocol v2](docs/phase-1/phase-1-protocol.md) | Correlation IDs, API keys + versions, numeric error codes, `LIST_OFFSETS`, `METADATA` | ✅ done |
 | **2** | [Storage engine](docs/phase-2/phase-2-storage.md) | Segments, sparse index, CRC32, retention, truncation | ✅ done |
-| 3 | Partitioning | Key hashing, batching, `acks`, retries — **load balancing** | next |
-| 4 | Consumer groups | Coordinator, rebalance, server-side offsets, delivery semantics | |
+| **3** | [Partitioning](docs/phase-3/phase-3-partitioning.md) | Key hashing, batching, `acks`, retries, PRODUCE v1 — **load balancing** | ✅ done |
+| 4 | Consumer groups | Coordinator, rebalance, server-side offsets, delivery semantics | next |
 | 5 | Cluster | Multi-broker, membership, controller election, metadata routing | |
 | 6 | Replication | Leader/follower, ISR, high watermark, failover — **fault tolerance** | |
 | 7 | Capstone | Full demo, benchmark table, honest limitations | |
@@ -153,12 +161,15 @@ common/     protocol.py   wire format: encode/decode
             config.py     every default in one place
             errors.py     numeric error codes, retriable or not
 broker/     broker.py     asyncio TCP server, request routing
+            metadata.py   which topics exist and how wide they are
             partition.py  identity + the write lock, over a Log
             log/          record.py  one record: length + CRC32 + JSON
                           index.py   sparse offset → byte position
                           segment.py one .log and its .index
                           log.py     ordered segments, rolling, retention
-producer/   producer.py   write client
+producer/   producer.py   write client: async send, retries, acks
+            partitioner.py murmur2 key routing + sticky batching
+            batch.py      accumulator, sender thread, futures
 consumer/   consumer.py   read client, offset tracking, commit semantics
 tools/      kfk.py        admin CLI
 tests/      conftest.py   real broker on an ephemeral port
@@ -170,6 +181,7 @@ docs/       00-overview.md          concepts, before any code
             phase-0/                foundation + code reading guide
             phase-1/                protocol v2
             phase-2/                storage engine
+            phase-3/                partitioning + batching
 ```
 
 ---
@@ -179,7 +191,16 @@ docs/       00-overview.md          concepts, before any code
 Stated plainly, because a system that only lists its strengths is a sales
 pitch:
 
-- **One partition per topic, one broker.** No distribution yet — Phases 3 and 5.
+- **One broker.** Partitions exist, but they all live on one machine — Phase 5.
+- **No compression.** Real Kafka compresses a batch as a unit, which is where
+  batching's *other* big win comes from. The remaining produce ceiling is
+  largely uncompressed JSON.
+- **Unbounded producer memory.** A real producer has `buffer.memory` and blocks
+  when it is full, applying backpressure. Ours grows until the process dies.
+- **No idempotent producer.** `max_in_flight` defaults to 1 because a retried
+  batch could otherwise land after a later one and reorder a partition.
+- **Partition counts are immutable.** Stricter than Kafka, which permits
+  increases. See `chaos/partition_balance.py` for why changing them is costly.
 - **No compaction.** Retention deletes old segments; it cannot keep the latest
   value per key. Phase 4's `__consumer_offsets` will need it.
 - **No fsync.** Writes reach the OS page cache, not the platter. A process

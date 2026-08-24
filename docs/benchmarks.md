@@ -19,6 +19,12 @@ worse than no benchmark, because it feels like evidence.
 | **0 — Foundation** | 3,982 | 0.55 | 17,081 | 13.81 | Baseline. One round trip per message; O(n) log scan per fetch. |
 | **1 — Protocol v2** | 3,946 | 0.50 | 17,007 | 12.12 | Correlation IDs, API versions, error codes. Header 12→16 bytes. **No throughput change, as expected** — see below. |
 | **2 — Storage engine** | 3,718 | 0.49 | **101,732** | **1.50** | Segments + sparse index + CRC + retention. **Consume 6.0x faster, p99 8.1x lower, and now flat with log size.** |
+| **3 — Partitioning** | **45,082** † | 0.03 † | 102,594 | 1.40 | Batching, key routing, `acks`, PRODUCE v1. **Produce 12.0x faster.** |
+
+† Batched producer. Sequential produce on the same run was 3,764 msg/s — the
+comparison, not a regression. The p99 is the **caller's** cost: `send()`
+returns without sending, so it measures how long the application is blocked,
+not how long the message takes to reach disk. See below.
 | 3 — Partitioning | | | | | Batching + `linger.ms` → produce should jump ~10-50x |
 | 4 — Consumer groups | | | | | Server-side offsets; expect a small commit cost |
 | 5 — Cluster | | | | | Partitions across brokers |
@@ -216,6 +222,65 @@ Produce is still ~3,700 msg/s and still bounded by ~230 µs of per-message
 broker work. Segments did not touch that, because the bottleneck was never
 storage layout — it is one message per request. Phase 3's batching is what
 moves it.
+
+---
+
+## Phase 3: the bottleneck that was always the bottleneck
+
+Since Phase 1 the cost breakdown had said the same thing every run:
+
+```
+PRODUCE, sequential                265.7 µs
+  → loopback round-trip wait        47.2 µs    ← pipelining removes this
+  → broker work (thread hop + disk) 218.4 µs   ← nothing had touched it
+```
+
+218 µs of thread hop, file write, flush, and JSON decode — **paid once per
+message, because one request carried one message.** Phase 1 proved pipelining
+could not help (the broker was never idle). Phase 2 did not touch it (the
+bottleneck was never storage layout).
+
+Batching is the only thing that could, and it did:
+
+| 20,000 × 100-byte messages | msg/s | vs sequential |
+|---|---:|---:|
+| PRODUCE sequential | 3,764 | — |
+| PRODUCE pipelined (100 in flight) | 3,806 | 1.01x |
+| **PRODUCE batched (linger 5 ms, 16 KB)** | **45,082** | **12.0x** |
+
+Same broker, same protocol, same disk. The only change is how many messages
+ride in one request, which is exactly what the cost breakdown predicted would
+matter.
+
+### Read the latency column carefully
+
+```
+PRODUCE batched   latency (ms): p50=0.006  p95=0.009  p99=0.029  max=13.958
+```
+
+Six **microseconds** at p50 — because `send()` no longer sends. It appends to
+a buffer and returns, so that number is *the caller's blocking time*, not the
+time for a message to reach disk. The `max` of 13.9 ms is a caller that
+happened to arrive while the sender thread held the accumulator lock.
+
+**This is not a like-for-like comparison with the sequential row**, and
+presenting it as one would be a lie by omission. End-to-end latency got
+*worse*, by design: with `linger_ms=5`, a message landing in an empty batch
+waits up to 5 ms before it is sent at all.
+
+> **You bought 12x throughput with up to 5 ms of latency.** `linger_ms=0` buys
+> the latency back and gives up most of the throughput. There is no setting
+> that is right for everything, which is why it is a setting.
+
+### What is still unchanged
+
+Consume is 102,594 msg/s and the seek profile is still flat — Phase 3 touched
+the write path only, and it is reassuring that it left the read path alone.
+
+The remaining produce ceiling is no longer per-message overhead; it is that
+records are appended one at a time inside the batch (`_append_records` loops)
+and the payload is still uncompressed JSON. Compression is the next big lever
+and we do not implement it.
 
 ---
 
