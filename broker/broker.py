@@ -72,15 +72,21 @@ import logging
 import os
 import threading
 
+from broker.coordinator import GroupCoordinator
 from broker.log import LogConfig
 from broker.metadata import InvalidTopicError, MetadataStore
+from broker.offset_store import OffsetStore
 from broker.partition import Partition
 from common import errors
 from common.config import (
-    DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_RETENTION_CHECK_MS,
+    DEFAULT_DATA_DIR, DEFAULT_GROUP_REAP_MS, DEFAULT_HOST, DEFAULT_PORT,
+    DEFAULT_RETENTION_CHECK_MS,
 )
 from common.protocol import (
-    API_CREATE_TOPICS, API_FETCH, API_LIST_OFFSETS, API_METADATA, API_PRODUCE,
+    API_CREATE_TOPICS, API_DESCRIBE_GROUPS, API_FETCH, API_FIND_COORDINATOR,
+    API_HEARTBEAT, API_JOIN_GROUP, API_LEAVE_GROUP, API_LIST_GROUPS,
+    API_LIST_OFFSETS, API_METADATA, API_OFFSET_COMMIT, API_OFFSET_FETCH,
+    API_PRODUCE, API_SYNC_GROUP,
     HEADER_SIZE, MAGIC, MAX_REQUEST_BYTES,
     TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
     api_name, decode_body, decode_header, encode_message, is_supported,
@@ -95,10 +101,25 @@ class Broker:
                  log_config: LogConfig = None,
                  retention_check_ms: float = DEFAULT_RETENTION_CHECK_MS,
                  auto_create_topics: bool = True,
-                 default_partitions: int = 1):
+                 default_partitions: int = 1,
+                 group_reap_ms: float = DEFAULT_GROUP_REAP_MS):
         self.host = host
         self.port = port          # rewritten with the real port if port == 0
         self.data_dir = data_dir
+
+        # Every broker in a cluster needs a stable identity: partition
+        # assignments, leadership, and replica sets are all expressed as
+        # broker IDs, not host:port (which can change when a machine is
+        # replaced). With one broker it is always 0 — but METADATA already
+        # reports it, so Phase 5 adds peers rather than a new concept.
+        self.node_id = node_id
+
+        # Storage tuning applied to every partition this broker creates.
+        # Real Kafka allows per-topic overrides; we have nowhere to hang them
+        # yet, so it is broker-wide.
+        self.log_config = log_config or LogConfig()
+        self.retention_check_ms = retention_check_ms
+        self.group_reap_ms = group_reap_ms
 
         # Which topics exist and how many partitions each has. A partition
         # count has to be DECLARED rather than inferred from which directories
@@ -107,18 +128,11 @@ class Broker:
         self.metadata = MetadataStore(data_dir, auto_create=auto_create_topics,
                                       default_partitions=default_partitions)
 
-        # Storage tuning applied to every partition this broker creates.
-        # Real Kafka allows per-topic overrides; we have no topic metadata to
-        # hang them on until Phase 3, so it is broker-wide for now.
-        self.log_config = log_config or LogConfig()
-        self.retention_check_ms = retention_check_ms
-
-        # Every broker in a cluster needs a stable identity: partition
-        # assignments, leadership, and replica sets are all expressed as
-        # broker IDs, not host:port (which can change when a machine is
-        # replaced). With one broker it is always 0 — but METADATA already
-        # reports it, so Phase 5 adds peers rather than a new concept.
-        self.node_id = node_id
+        # Consumer groups: membership and fencing here, committed positions in
+        # `__consumer_offsets`. Note what the coordinator does NOT do — it
+        # never computes an assignment. A client does.
+        self.coordinator = GroupCoordinator(node_id=node_id)
+        self.offsets = OffsetStore(data_dir, self.log_config)
 
         # CONCEPT: The partition registry.
         #   (topic, partition_id) → Partition
@@ -235,6 +249,31 @@ class Broker:
             return await self._handle_list_offsets(payload)
         if api_key == API_METADATA:
             return await self._handle_metadata(payload)
+
+        # ── Consumer group APIs ────────────────────────────────
+        # Every one of these can raise a KafkaError from the coordinator —
+        # ILLEGAL_GENERATION, UNKNOWN_MEMBER_ID, REBALANCE_IN_PROGRESS — so
+        # they share one translation layer rather than each repeating a
+        # try/except. Those errors are normal protocol outcomes here, not
+        # failures: a rebalance is a thing that happens, and telling the client
+        # about it with a code is the whole mechanism.
+        group_handlers = {
+            API_FIND_COORDINATOR: self._handle_find_coordinator,
+            API_JOIN_GROUP: self._handle_join_group,
+            API_SYNC_GROUP: self._handle_sync_group,
+            API_HEARTBEAT: self._handle_heartbeat,
+            API_LEAVE_GROUP: self._handle_leave_group,
+            API_OFFSET_COMMIT: self._handle_offset_commit,
+            API_OFFSET_FETCH: self._handle_offset_fetch,
+            API_LIST_GROUPS: self._handle_list_groups,
+            API_DESCRIBE_GROUPS: self._handle_describe_group,
+        }
+        handler = group_handlers.get(api_key)
+        if handler is not None:
+            try:
+                return await handler(payload)
+            except errors.KafkaError as exc:
+                return _error(exc.error_code, str(exc))
 
         # Unreachable: is_supported() already rejected unknown keys. Kept as a
         # belt-and-braces guard, because "unreachable" and "unreached" differ.
@@ -565,6 +604,223 @@ class Broker:
             'topics': topics,
         }
 
+    # ── Consumer group handlers ────────────────────────────────
+
+    async def _handle_find_coordinator(self, payload: dict) -> dict:
+        """
+        Which broker coordinates this group?
+
+        Always us, because there is only one broker. The API exists now anyway
+        so that Phase 5 adds a CLUSTER rather than a protocol change — real
+        Kafka hashes the group id to pick a coordinator, spreading groups
+        across brokers so no single node owns every group's state.
+        """
+        if not payload.get('group_id'):
+            return _error(errors.INVALID_REQUEST, "'group_id' is required")
+        return {'error_code': errors.NONE, 'node_id': self.node_id,
+                'host': self.host, 'port': self.port}
+
+    async def _handle_join_group(self, payload: dict) -> dict:
+        """
+        Join a group. **This request is held open** until the join phase ends.
+
+        That is not a quirk — the coordinator cannot answer the first member
+        until it knows who else is joining, because the leader needs the full
+        member list to compute an assignment. Real Kafka calls the holding
+        area "purgatory".
+
+        Holding a request is also the clearest justification for asyncio in
+        this project: an awaited Event costs a few hundred bytes, where a
+        thread-per-request server would park an OS thread per member of every
+        rebalancing group.
+        """
+        group_id = payload.get('group_id')
+        topics = payload.get('topics', [])
+
+        if not group_id:
+            return _error(errors.INVALID_REQUEST, "'group_id' is required")
+        if not topics:
+            return _error(errors.INVALID_REQUEST, "'topics' must not be empty")
+
+        result = await self.coordinator.join_group(
+            group_id,
+            payload.get('member_id', ''),
+            topics,
+            payload.get('session_timeout_ms', 10_000),
+            payload.get('rebalance_timeout_ms', 5_000),
+        )
+
+        # The leader needs partition counts to compute an assignment. Sending
+        # them with the join response saves it a separate METADATA round trip
+        # at the exact moment the whole group is stalled waiting for it.
+        if result['is_leader']:
+            counts = {}
+            for topic in {t for m in result['members'] for t in m['topics']}:
+                config = self.metadata.get(topic)
+                if config is None:
+                    config = self.metadata.get_or_create(topic)
+                counts[topic] = config.partitions
+            result['partition_counts'] = counts
+
+        log.info("JOIN_GROUP %s member=%s gen=%s leader=%s",
+                 group_id, result['member_id'][:8], result['generation_id'],
+                 result['is_leader'])
+
+        result['error_code'] = errors.NONE
+        return result
+
+    async def _handle_sync_group(self, payload: dict) -> dict:
+        """Leader uploads assignments; everyone else collects theirs."""
+        group_id = payload.get('group_id')
+        member_id = payload.get('member_id')
+        if not group_id or not member_id:
+            return _error(errors.INVALID_REQUEST,
+                          "'group_id' and 'member_id' are required")
+
+        result = await self.coordinator.sync_group(
+            group_id, member_id, payload.get('generation_id', -1),
+            payload.get('assignments'))
+        result['error_code'] = errors.NONE
+        return result
+
+    async def _handle_heartbeat(self, payload: dict) -> dict:
+        result = await self.coordinator.heartbeat(
+            payload.get('group_id'), payload.get('member_id'),
+            payload.get('generation_id', -1))
+        result['error_code'] = errors.NONE
+        return result
+
+    async def _handle_leave_group(self, payload: dict) -> dict:
+        result = await self.coordinator.leave_group(
+            payload.get('group_id'), payload.get('member_id'))
+        result['error_code'] = errors.NONE
+        return result
+
+    async def _handle_offset_commit(self, payload: dict) -> dict:
+        """
+        Record a group's positions, fenced by generation.
+
+        The fencing check is the point. A consumer that paused past its session
+        timeout was evicted and its partitions reassigned; if its late commit
+        were accepted it would rewind the group behind the replacement's
+        progress, and those messages would be processed twice with nothing
+        reporting it.
+
+        `member_id` may be omitted for a consumer using `assign()` rather than
+        `subscribe()` — no group membership means nothing to fence against,
+        which is a real trade: manual assignment gives up the protection along
+        with the coordination.
+        """
+        group_id = payload.get('group_id')
+        offsets = payload.get('offsets', [])
+        if not group_id:
+            return _error(errors.INVALID_REQUEST, "'group_id' is required")
+
+        member_id = payload.get('member_id')
+        if member_id:
+            async with self.coordinator._lock:
+                group = self.coordinator._group(group_id)
+                self.coordinator._check_member(
+                    group, member_id, payload.get('generation_id', -1))
+                group.members[member_id].touch()
+
+        results = []
+        for entry in offsets:
+            topic = entry.get('topic')
+            partition = entry.get('partition', 0)
+            offset = entry.get('offset', 0)
+            if not topic:
+                results.append({'topic': topic, 'partition': partition,
+                                'error_code': errors.INVALID_REQUEST})
+                continue
+
+            await self._run_blocking(self.offsets.commit, group_id, topic,
+                                     partition, offset)
+            results.append({'topic': topic, 'partition': partition,
+                            'error_code': errors.NONE})
+
+        return {'error_code': errors.NONE, 'offsets': results}
+
+    async def _handle_offset_fetch(self, payload: dict) -> dict:
+        """
+        Read back a group's committed positions.
+
+        An offset of -1 means "this group has never committed this partition",
+        which is different from 0. The consumer applies its reset policy
+        (earliest or latest) rather than assuming either — collapsing the two
+        would make a brand-new group silently replay everything, or silently
+        skip it, depending on which default you happened to pick.
+        """
+        group_id = payload.get('group_id')
+        if not group_id:
+            return _error(errors.INVALID_REQUEST, "'group_id' is required")
+
+        requested = payload.get('partitions')
+        if requested:
+            offsets = [
+                {'topic': entry['topic'], 'partition': entry.get('partition', 0),
+                 'offset': self.offsets.fetch(group_id, entry['topic'],
+                                              entry.get('partition', 0))}
+                for entry in requested
+            ]
+        else:
+            offsets = [
+                {'topic': topic, 'partition': partition, 'offset': offset}
+                for (topic, partition), offset
+                in sorted(self.offsets.fetch_group(group_id).items())
+            ]
+
+        return {'error_code': errors.NONE, 'group_id': group_id,
+                'offsets': offsets}
+
+    async def _handle_list_groups(self, payload: dict) -> dict:
+        """
+        Every group this broker knows about.
+
+        Includes groups that only exist in `__consumer_offsets` — a group whose
+        members have all gone away still has committed positions, and hiding it
+        would make "where did my consumer get to?" unanswerable after a
+        shutdown. That is precisely when you want to look.
+        """
+        live = {}
+        for group_id in await self.coordinator.list_groups():
+            described = await self.coordinator.describe(group_id)
+            live[group_id] = {
+                'group_id': group_id,
+                'state': described['state'],
+                'members': len(described['members']),
+                'generation_id': described['generation_id'],
+            }
+
+        for group_id in self.offsets.groups():
+            live.setdefault(group_id, {
+                'group_id': group_id, 'state': 'Empty (has offsets)',
+                'members': 0, 'generation_id': -1})
+
+        return {'error_code': errors.NONE,
+                'groups': [live[g] for g in sorted(live)]}
+
+    async def _handle_describe_group(self, payload: dict) -> dict:
+        group_id = payload.get('group_id')
+        if not group_id:
+            return _error(errors.INVALID_REQUEST, "'group_id' is required")
+
+        try:
+            described = await self.coordinator.describe(group_id)
+        except errors.UnknownMemberIdError:
+            # A group with committed offsets but no live members is a real and
+            # normal state — every consumer shut down. Report it rather than
+            # erroring, so its lag is still inspectable.
+            if group_id in self.offsets.groups():
+                described = {'group_id': group_id, 'state': 'Empty',
+                             'generation_id': -1, 'leader_id': None,
+                             'protocol': 'range', 'members': []}
+            else:
+                raise
+
+        described['error_code'] = errors.NONE
+        return described
+
     # ── Connection handling ────────────────────────────────────
 
     async def handle_client(self, reader: asyncio.StreamReader,
@@ -716,13 +972,44 @@ class Broker:
         self.ready.set()
 
         cleaner = asyncio.create_task(self._retention_loop())
+        reaper = asyncio.create_task(self._group_reap_loop())
 
         async with server:
             await self._shutdown.wait()
 
         cleaner.cancel()
+        reaper.cancel()
+        self.offsets.close()
         self._close_partitions()
         log.info("Broker stopped.")
+
+    async def _group_reap_loop(self) -> None:
+        """
+        Periodically evict group members that stopped heartbeating.
+
+        CONCEPT: why a timer is required, not just lazy checks.
+          Eviction otherwise happens only when SOMEBODY calls in — and if every
+          member of a group dies at once, nobody ever calls in again. The group
+          would sit forever in `Stable`, holding partitions on behalf of
+          processes that no longer exist, and `kfk groups describe` would show
+          a healthy group that is consuming nothing.
+
+        Guarded like the retention sweep: a bug here must not take down a
+        broker that is otherwise serving reads and writes perfectly well.
+        """
+        interval = self.group_reap_ms / 1000.0
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                evicted = await self.coordinator.reap_expired()
+                for group_id, members in evicted.items():
+                    log.info("Group %s: evicted %d member(s) that stopped "
+                             "heartbeating; rebalance triggered",
+                             group_id, len(members))
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("Group reap failed; will retry next interval")
 
     async def _retention_loop(self) -> None:
         """
