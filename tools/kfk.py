@@ -43,8 +43,9 @@ from common.config import (
 from common.errors import ERROR_NAMES, KafkaError, raise_for_error
 from common.net import BrokerConnectionError, SyncConnection
 from common.protocol import (
-    API_CREATE_TOPICS, API_FETCH, API_LIST_OFFSETS, API_METADATA,
-    TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
+    API_CREATE_TOPICS, API_DESCRIBE_GROUPS as API_DESCRIBE_GROUP,
+    API_FETCH, API_LIST_GROUPS, API_LIST_OFFSETS, API_METADATA,
+    API_OFFSET_FETCH, TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
 )
 
 
@@ -378,6 +379,80 @@ def cmd_segments(args) -> int:
     return 0
 
 
+def cmd_groups_list(args) -> int:
+    response = _request(args, API_LIST_GROUPS, {})
+    groups = response['groups']
+
+    if not groups:
+        print("No consumer groups.")
+        return 0
+
+    print(f"{'GROUP':<28}{'STATE':<22}{'MEMBERS':>8}{'GEN':>6}")
+    for group in groups:
+        print(f"{group['group_id']:<28}{group['state']:<22}"
+              f"{group['members']:>8}{group['generation_id']:>6}")
+    return 0
+
+
+def cmd_groups_describe(args) -> int:
+    """
+    Show a group's membership, assignment, and **lag**.
+
+    Lag is the number everyone alarms on: the gap between what has been written
+    and what this group has committed. Steady lag means the consumer keeps up;
+    growing lag means it does not, and eventually retention deletes data nobody
+    has read — silent loss that looks like a monitoring problem right up until
+    it is a data problem.
+    """
+    group = _request(args, API_DESCRIBE_GROUP, {'group_id': args.group})
+
+    print(f"Group      : {group['group_id']}")
+    print(f"State      : {group['state']}")
+    print(f"Generation : {group['generation_id']}")
+    print(f"Members    : {len(group['members'])}")
+    print(f"Assignor   : {group['protocol']}\n")
+
+    # Which partition belongs to whom, so lag can be attributed to a member.
+    owner = {}
+    for member in group['members']:
+        for topic, partition in member['assignment']:
+            owner[(topic, partition)] = member['member_id']
+
+    committed = {(entry['topic'], entry['partition']): entry['offset']
+                 for entry in _request(args, API_OFFSET_FETCH,
+                                       {'group_id': args.group})['offsets']}
+
+    topics = sorted({topic for topic, _p in set(owner) | set(committed)})
+    if not topics:
+        print("  (this group has no assignment and has never committed)")
+        return 0
+
+    end_offsets = {}
+    for topic in topics:
+        for entry in _request(args, API_METADATA,
+                              {'topics': [topic]})['topics'][0]['partitions']:
+            end_offsets[(topic, entry['partition'])] = entry['high_watermark']
+
+    print(f"  {'TOPIC':<20}{'PART':>5}{'CURRENT':>10}{'END':>10}{'LAG':>8}  OWNER")
+    total_lag = 0
+    for tp in sorted(set(owner) | set(committed)):
+        current = committed.get(tp, -1)
+        end = end_offsets.get(tp, 0)
+        lag = max(0, end - current) if current >= 0 else end
+        total_lag += lag
+        member = owner.get(tp)
+        label = member[:8] if member else '(unassigned)'
+        shown = current if current >= 0 else '-'
+        print(f"  {tp[0]:<20}{tp[1]:>5}{str(shown):>10}{end:>10}{lag:>8}  {label}")
+
+    print(f"\n  total lag: {total_lag:,}")
+    unassigned = [tp for tp in committed if tp not in owner]
+    if unassigned:
+        print(f"  ⚠ {len(unassigned)} partition(s) committed but not currently "
+              f"assigned — nobody is reading them")
+    return 0
+
+
 def cmd_offsets(args) -> int:
     """
     List every committed consumer offset on this machine.
@@ -467,6 +542,16 @@ def main() -> int:
     p.add_argument('--topic', required=True)
     p.add_argument('--partition', type=int, default=0)
     p.set_defaults(func=cmd_segments)
+
+    groups = sub.add_parser('groups', help='list and describe consumer groups')
+    groups_sub = groups.add_subparsers(dest='groups_command', required=True)
+
+    g = groups_sub.add_parser('list', help='all consumer groups')
+    g.set_defaults(func=cmd_groups_list)
+
+    g = groups_sub.add_parser('describe', help='members, assignment and lag')
+    g.add_argument('--group', required=True)
+    g.set_defaults(func=cmd_groups_describe)
 
     p = sub.add_parser('offsets', help='list local committed consumer offsets')
     p.set_defaults(func=cmd_offsets)

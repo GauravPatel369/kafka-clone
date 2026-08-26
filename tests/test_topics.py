@@ -9,6 +9,7 @@ shift underneath running clients.
 
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -321,9 +322,24 @@ def test_acks_zero_gets_no_reply_and_no_offset(multi_broker, offsets_dir):
 
     assert all(f.get() == -1 for f in futures), "no offset is reported"
 
+    # The messages do arrive — but we have to POLL for them, and that is not a
+    # test-writing inconvenience, it is the semantic itself.
+    #
+    # With acks=1 the reply proves the message is in the log, so a consumer can
+    # read immediately. With acks=0 there is no reply, so there is no moment at
+    # which the producer knows the write landed. `flush()` returns when the
+    # bytes are on the wire, which is strictly weaker.
+    #
+    # A test that asserted this without retrying would be flaky, and the
+    # flakiness would be telling us something true.
+    deadline = time.monotonic() + 5.0
+    received = []
     with Consumer('127.0.0.1', multi_broker.port, 'fireforget', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
-        assert len(c.poll()) == 10, "the messages did arrive"
+        while len(received) < 10 and time.monotonic() < deadline:
+            received.extend(c.poll())
+
+    assert len(received) == 10, "the messages did arrive, eventually"
 
 
 def test_the_connection_survives_mixing_acks_zero_and_one(multi_broker):

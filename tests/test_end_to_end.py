@@ -389,7 +389,7 @@ def test_consumer_recovers_from_lost_data_by_seeking(broker, offsets_dir, tmp_pa
     with Consumer('127.0.0.1', broker.port, 'reset', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
         c.seek_to_beginning()
-        assert c.position == 0, "nothing deleted yet, so the start is still 0"
+        assert c.position[('reset', 0)] == 0, "nothing deleted yet, so the start is still 0"
         assert len(c.poll()) == 10
 
 
@@ -452,7 +452,7 @@ def test_seek_to_end_skips_existing_messages(broker, offsets_dir):
     with Consumer('127.0.0.1', broker.port, 'skip', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
         c.seek_to_end()
-        assert c.position == 5
+        assert c.position[('skip', 0)] == 5
         assert c.poll() == [], "the five old messages are skipped"
 
         with Producer('127.0.0.1', broker.port, 'skip', quiet=True) as p:
@@ -470,7 +470,7 @@ def test_seek_to_beginning_asks_the_broker(broker, offsets_dir):
         c.poll()
         c.commit()
         c.seek_to_beginning()
-        assert c.position == 0
+        assert c.position[('rewind', 0)] == 0
         assert len(c.poll()) == 4
 
 
@@ -488,12 +488,14 @@ def test_poll_does_not_commit(broker, offsets_dir):
     with Consumer('127.0.0.1', broker.port, 'commits', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
         c.poll()
-        assert c.position == 5, "position advances in memory"
-        assert c.committed == 0, "nothing is committed until commit() is called"
+        assert c.position[('commits', 0)] == 5, "position advances in memory"
+        assert c.committed[('commits', 0)] == -1, (
+            "nothing is committed until commit() is called; -1 means this "
+            "group has never committed, which is NOT the same as 0")
 
     with Consumer('127.0.0.1', broker.port, 'commits', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
-        assert c.position == 0
+        assert c.position[('commits', 0)] == 0
         assert len(c.poll()) == 5, "uncommitted messages are redelivered"
 
 
@@ -508,7 +510,7 @@ def test_committed_offset_survives_a_restart(broker, offsets_dir):
 
     with Consumer('127.0.0.1', broker.port, 'resume', 0, 'g',
                   offset_dir=offsets_dir, quiet=True) as c:
-        assert c.position == 4
+        assert c.position[('resume', 0)] == 4
         assert [m['value'] for m in c.poll()] == [f"m{i}" for i in range(4, 10)]
 
 
