@@ -127,14 +127,16 @@ API_METADATA = 3
 
 API_CREATE_TOPICS = 19         # implemented in Phase 3
 
-# Reserved — defined so the numbers are claimed, not yet implemented.
-API_OFFSET_COMMIT = 8          # Phase 4
-API_OFFSET_FETCH = 9           # Phase 4
-API_FIND_COORDINATOR = 10      # Phase 4
-API_JOIN_GROUP = 11            # Phase 4
-API_HEARTBEAT = 12             # Phase 4
-API_LEAVE_GROUP = 13           # Phase 4
-API_SYNC_GROUP = 14            # Phase 4
+# Consumer groups — implemented in Phase 4.
+API_OFFSET_COMMIT = 8
+API_OFFSET_FETCH = 9
+API_FIND_COORDINATOR = 10
+API_JOIN_GROUP = 11
+API_HEARTBEAT = 12
+API_LEAVE_GROUP = 13
+API_SYNC_GROUP = 14
+API_DESCRIBE_GROUPS = 15
+API_LIST_GROUPS = 16
 
 API_NAMES = {
     API_PRODUCE: 'PRODUCE',
@@ -148,6 +150,8 @@ API_NAMES = {
     API_HEARTBEAT: 'HEARTBEAT',
     API_LEAVE_GROUP: 'LEAVE_GROUP',
     API_SYNC_GROUP: 'SYNC_GROUP',
+    API_DESCRIBE_GROUPS: 'DESCRIBE_GROUPS',
+    API_LIST_GROUPS: 'LIST_GROUPS',
     API_CREATE_TOPICS: 'CREATE_TOPICS',
 }
 
@@ -171,6 +175,15 @@ SUPPORTED_VERSIONS = {
     API_LIST_OFFSETS: (0, 0),
     API_METADATA: (0, 0),
     API_CREATE_TOPICS: (0, 0),
+    API_OFFSET_COMMIT: (0, 0),
+    API_OFFSET_FETCH: (0, 0),
+    API_FIND_COORDINATOR: (0, 0),
+    API_JOIN_GROUP: (0, 0),
+    API_HEARTBEAT: (0, 0),
+    API_LEAVE_GROUP: (0, 0),
+    API_SYNC_GROUP: (0, 0),
+    API_DESCRIBE_GROUPS: (0, 0),
+    API_LIST_GROUPS: (0, 0),
 }
 
 # ── LIST_OFFSETS timestamp sentinels (Kafka's real values) ─────

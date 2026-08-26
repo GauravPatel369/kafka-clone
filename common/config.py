@@ -82,6 +82,41 @@ DEFAULT_FSYNC_MS = 0                            # 0 = never
 # How often the broker runs the retention cleaner. Kafka's default is 5 minutes.
 DEFAULT_RETENTION_CHECK_MS = 60_000             # 1 minute
 
+# ── Consumer groups (Phase 4) ──────────────────────────────────
+
+# How long a member may go without heartbeating before it is evicted and its
+# partitions reassigned.
+#
+# A genuine dilemma with no right answer:
+#   short (3s)   dead consumers detected fast; a GC pause or a network blip
+#                triggers a SPURIOUS rebalance, stopping consumption for
+#                everyone in the group.
+#   long (60s)   stable under hiccups; a genuinely dead consumer's partitions
+#                go unread for a minute.
+#
+# Kafka's real answer is two timeouts: `session.timeout.ms` for the heartbeat
+# thread (is the PROCESS alive?) and `max.poll.interval.ms` for the poll loop
+# (is PROCESSING progressing?). Separating them means slow processing stops
+# looking like a dead process. We implement the first only.
+DEFAULT_SESSION_TIMEOUT_MS = 10_000
+
+# How often the consumer's background thread heartbeats. Kafka's guidance is
+# roughly a third of the session timeout, so two consecutive heartbeats can be
+# lost before anyone is evicted — one dropped packet should not cost the whole
+# group a rebalance.
+DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000
+
+# How long the coordinator waits for every known member to rejoin before
+# proceeding without the absentees.
+DEFAULT_REBALANCE_TIMEOUT_MS = 5_000
+
+# How often the broker sweeps groups for members that stopped heartbeating.
+#
+# Needed because eviction otherwise only happens when somebody calls in — and
+# if every member of a group dies at once, nobody ever calls in again. The
+# group would sit forever holding partitions for processes that no longer exist.
+DEFAULT_GROUP_REAP_MS = 5_000
+
 # ── Client behaviour ───────────────────────────────────────────
 DEFAULT_MAX_MESSAGES  = 100    # messages per FETCH request
 DEFAULT_POLL_INTERVAL = 1.0    # seconds to sleep when a poll returns nothing

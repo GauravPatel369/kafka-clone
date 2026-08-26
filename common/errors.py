@@ -74,6 +74,8 @@ NOT_LEADER_OR_FOLLOWER = 6
 REQUEST_TIMED_OUT = 7
 MESSAGE_TOO_LARGE = 10
 NOT_ENOUGH_REPLICAS = 19
+ILLEGAL_GENERATION = 22
+UNKNOWN_MEMBER_ID = 25
 REBALANCE_IN_PROGRESS = 27
 UNSUPPORTED_VERSION = 35
 INVALID_REQUEST = 42
@@ -90,6 +92,8 @@ ERROR_NAMES = {
     REQUEST_TIMED_OUT: 'REQUEST_TIMED_OUT',
     MESSAGE_TOO_LARGE: 'MESSAGE_TOO_LARGE',
     NOT_ENOUGH_REPLICAS: 'NOT_ENOUGH_REPLICAS',
+    ILLEGAL_GENERATION: 'ILLEGAL_GENERATION',
+    UNKNOWN_MEMBER_ID: 'UNKNOWN_MEMBER_ID',
     REBALANCE_IN_PROGRESS: 'REBALANCE_IN_PROGRESS',
     UNSUPPORTED_VERSION: 'UNSUPPORTED_VERSION',
     INVALID_REQUEST: 'INVALID_REQUEST',
@@ -198,10 +202,40 @@ class NotEnoughReplicasError(RetriableError):
 
 
 class RebalanceInProgressError(RetriableError):
-    """The consumer group is redistributing partitions; retry after it settles.
+    """
+    The group is redistributing partitions; rejoin and retry.
 
-    Phase 4."""
+    Retriable, and the retry is not a plain resend: the member must rejoin the
+    group first. This is how a consumer LEARNS about a rebalance it did not
+    cause — its heartbeat comes back with this code.
+    """
     error_code = REBALANCE_IN_PROGRESS
+
+
+class IllegalGenerationError(RetriableError):
+    """
+    Your generation number is stale: the group rebalanced without you.
+
+    THE zombie fence. A consumer that paused past its session timeout was
+    evicted and its partitions reassigned; when it wakes and tries to commit,
+    this rejects it. Without that rejection its stale commit would rewind the
+    group and silently reprocess everything the replacement had already done.
+
+    Retriable in the sense that rejoining and retrying will work — but the
+    consumer must throw away its in-flight work first, because those partitions
+    now belong to someone else.
+    """
+    error_code = ILLEGAL_GENERATION
+
+
+class UnknownMemberIdError(RetriableError):
+    """
+    The coordinator has never heard of this member, or evicted it.
+
+    Same remedy as ILLEGAL_GENERATION: rejoin from scratch with an empty
+    member id and accept whatever assignment you are given.
+    """
+    error_code = UNKNOWN_MEMBER_ID
 
 
 # ── Not retriable ──────────────────────────────────────────────
@@ -267,6 +301,7 @@ _BY_CODE = {
         UnknownTopicOrPartitionError, LeaderNotAvailableError, NotLeaderError,
         RequestTimedOutError, MessageTooLargeError, NotEnoughReplicasError,
         RebalanceInProgressError, UnsupportedVersionError, InvalidRequestError,
+        IllegalGenerationError, UnknownMemberIdError,
     )
 }
 
