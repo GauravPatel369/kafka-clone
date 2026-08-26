@@ -25,18 +25,29 @@ wrong, and that you understand the mechanism. That is what is being tested.
 
 ### Be honest about what is built
 
-**Built: Phases 0 and 1.** Single broker, append-only log, framed protocol with
-correlation IDs and error codes, at-least-once consumer, tests, benchmarks,
-chaos scripts, admin CLI.
+**Built: Phases 0 through 4.**
 
-**Designed but not built: Phases 2–7** — segments and index, partitioning,
-consumer groups, clustering, replication.
+| Phase | What it added |
+|---|---|
+| 0 | Test harness, benchmarks, chaos scripts, admin CLI; four bug fixes |
+| 1 | Protocol v2: correlation IDs, API versions, numeric error codes |
+| 2 | Storage engine: segments, sparse index, CRC32, retention |
+| 3 | Partitioning: murmur2 key routing, batching, `acks`, retries |
+| 4 | Consumer groups: coordinator, rebalancing, generation fencing, server-side offsets |
 
-Say so. "I've implemented through Phase 1; partitioning and replication are
+**Designed but not built: Phases 5–7** — multi-broker clustering, controller
+election, replication and ISR.
+
+Say so. "I've implemented through Phase 4; clustering and replication are
 designed and documented but not written yet" is a completely respectable
 answer, and it is the one that survives a follow-up question. Claiming
 replication you have not built collapses the moment someone asks how you handle
 the high watermark, and everything you *did* build loses credibility with it.
+
+**Also flag the honest gaps inside what IS built**, because they are the
+questions an interviewer will find anyway: `__consumer_offsets` has no
+compaction, there is no `max.poll.interval.ms`, rebalancing is eager rather
+than cooperative, and there is no compression.
 
 ---
 
@@ -147,13 +158,17 @@ index to the nearest entry, then scan forward a few KB.
 RAM. Sparse trades a short scan for a tiny index — and the scan is sequential,
 which is the operation disks are good at.
 
-> **Honest framing for your project:** "My current `fetch` scans the log from
-> byte zero every time — O(n). I measured it: fetch latency climbs from ~1 ms
-> at the start of a 5,000-message log to 13.8 ms at the end. Segments and a
-> sparse index are Phase 2 specifically to flatten that curve."
+> **Framing for your project:** "My first version scanned the log from byte
+> zero on every read — O(n). I measured it: fetch latency climbed from ~1 ms at
+> the start of a 5,000-message log to 13.8 ms at the end. So I built segments
+> plus a sparse index, and re-measured: the seek profile went flat, 1.07x from
+> offset 0 to offset 17,777 over 20,000 messages. Consume throughput went from
+> 17,007 to 101,732 msg/s, and produce cost 6% for the extra 8 bytes and the
+> checksum per record."
 
-That answer is *better* than having built it, because it shows you measured the
-problem before reaching for the solution.
+Measuring the problem before reaching for the solution — and re-measuring
+after — is the part that carries the answer. The 6% cost matters too: quoting
+only the win reads as a sales pitch.
 
 ### Q: What is log compaction and when would you use it?
 

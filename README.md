@@ -33,9 +33,14 @@ Preparing to be asked about this? **[docs/interview-questions.md](docs/interview
 maps every concept here to the questions it gets asked as, with the measured
 numbers from this repo to answer them with.
 
+Want to know exactly how a given flow is implemented?
+**[docs/flows.md](docs/flows.md)** traces every path — produce, fetch, rebalance,
+commit, retention, recovery — through the real call sequence, with file, line
+and code for each step.
+
 Want the wrong turns rather than the clean result?
 **[docs/challenges-and-solutions.md](docs/challenges-and-solutions.md)** is the
-development journal: fifteen real bugs, wrong predictions, and design dead
+development journal: nineteen real bugs, wrong predictions, and design dead
 ends — what broke, how it was caught, and what fixed it.
 
 ---
@@ -52,12 +57,13 @@ python -m broker.broker
 python -m tools.kfk topics create --topic orders --partitions 4
 python -m producer.producer --topic orders --count 2000
 
-# Terminal 3 — read one partition back
-python -m consumer.consumer --topic orders --partition 0 --group demo
+# Terminal 3 — join a consumer group (run several; they divide the partitions)
+python -m consumer.consumer --topic orders --group billing --loop
 
 # Look at what happened
 python -m tools.kfk topics describe --topic orders   # per-partition spread
 python -m tools.kfk segments --topic orders
+python -m tools.kfk groups describe --group billing   # assignment + lag
 python -m tools.kfk tail     --topic orders --count 5
 ```
 
@@ -71,6 +77,7 @@ python -m tools.kfk tail     --topic orders --count 5
 python -m chaos.kill_consumer_midprocess   # watch at-most-once lose data
 python -m chaos.corrupt_log                # watch CRCs catch three kinds of damage
 python -m chaos.partition_balance          # watch load balancing and its cost
+python -m chaos.kill_consumer              # kill a consumer, watch failover + fencing
 python -m bench.bench --count 20000        # throughput, percentiles, seek profile
 pytest -q                                  # the test suite
 ```
@@ -79,11 +86,12 @@ The chaos scripts are the most instructive minute in the repo. The first runs
 the same crash twice, moving one line, and shows five messages vanish in one
 run and get reprocessed in the other. The second corrupts a log three
 different ways — including one that Phase 1 would have served to a consumer as
-real data.
+real data. The fourth kills a group member and shows its partitions taken over
+in ~1 s, then shows the "dead" consumer coming back and being refused.
 
 ---
 
-## Architecture today (end of Phase 0)
+## Architecture today (end of Phase 4)
 
 ```
    ┌──────────┐                                    ┌──────────┐
@@ -95,11 +103,16 @@ real data.
    │          │◄─── messages + high_watermark ─────│          │
    └────┬─────┘                                    └────┬─────┘
         │                                               │
-   offsets/orders-0-demo.txt                     data/orders-0/
-   (committed position,                          ├── 00000000000000000000.log
-    written atomically)                          ├── 00000000000000000000.index
+  __consumer_offsets                             data/orders-0/
+  (committed positions, on the BROKER)           ├── 00000000000000000000.log
+  keyed by group|topic|partition                 ├── 00000000000000000000.index
                                                  └── 00000000000000011640.log  ACTIVE
 ```
+
+Consumers sharing a `group_id` form a group: the coordinator divides the
+topic's partitions among them, one member each, and reassigns when a member
+stops heartbeating. A generation number fences a member that was evicted while
+paused, so its late commit cannot rewind the group.
 
 A partition is a **directory of segments**, each named by the offset of its
 first record. One segment is active and takes appends; the rest are sealed and
@@ -133,8 +146,8 @@ clients decide what to retry without parsing English.
 | **1** | [Protocol v2](docs/phase-1/phase-1-protocol.md) | Correlation IDs, API keys + versions, numeric error codes, `LIST_OFFSETS`, `METADATA` | ✅ done |
 | **2** | [Storage engine](docs/phase-2/phase-2-storage.md) | Segments, sparse index, CRC32, retention, truncation | ✅ done |
 | **3** | [Partitioning](docs/phase-3/phase-3-partitioning.md) | Key hashing, batching, `acks`, retries, PRODUCE v1 — **load balancing** | ✅ done |
-| 4 | Consumer groups | Coordinator, rebalance, server-side offsets, delivery semantics | next |
-| 5 | Cluster | Multi-broker, membership, controller election, metadata routing | |
+| **4** | [Consumer groups](docs/phase-4/phase-4-consumer-groups.md) | Coordinator, rebalancing, generation fencing, server-side offsets | ✅ done |
+| 5 | Cluster | Multi-broker, membership, controller election, metadata routing | next |
 | 6 | Replication | Leader/follower, ISR, high watermark, failover — **fault tolerance** | |
 | 7 | Capstone | Full demo, benchmark table, honest limitations | |
 
@@ -162,6 +175,8 @@ common/     protocol.py   wire format: encode/decode
             errors.py     numeric error codes, retriable or not
 broker/     broker.py     asyncio TCP server, request routing
             metadata.py   which topics exist and how wide they are
+            coordinator.py group membership, generations, liveness
+            offset_store.py __consumer_offsets
             partition.py  identity + the write lock, over a Log
             log/          record.py  one record: length + CRC32 + JSON
                           index.py   sparse offset → byte position
@@ -170,18 +185,21 @@ broker/     broker.py     asyncio TCP server, request routing
 producer/   producer.py   write client: async send, retries, acks
             partitioner.py murmur2 key routing + sticky batching
             batch.py      accumulator, sender thread, futures
-consumer/   consumer.py   read client, offset tracking, commit semantics
+consumer/   consumer.py   read client: subscribe/assign, heartbeats, commits
+            assignor.py   range and round-robin partition assignment
 tools/      kfk.py        admin CLI
 tests/      conftest.py   real broker on an ephemeral port
 bench/      bench.py      throughput + latency percentiles
 chaos/                    scripts that break things on purpose
 docs/       00-overview.md          concepts, before any code
             benchmarks.md           one row per phase
+            flows.md                every code path, traced end to end
             interview-questions.md  concepts → questions, with our numbers
             phase-0/                foundation + code reading guide
             phase-1/                protocol v2
             phase-2/                storage engine
             phase-3/                partitioning + batching
+            phase-4/                consumer groups
 ```
 
 ---
@@ -211,10 +229,12 @@ pitch:
   bytes from page cache to socket without entering user space. We decode every
   record into Python objects and re-serialise them — the largest remaining
   performance gap.
-- **Consumer groups are a filename.** `group_id` only namespaces the local
-  offset file; the broker knows nothing about groups. Phase 4.
-- **Offsets are local files.** Move a consumer to another machine and it
-  starts over. Phase 4.
+- **No compaction on `__consumer_offsets`.** It grows with the number of
+  commits rather than the number of live keys, and every record is replayed at
+  broker startup.
+- **No `max.poll.interval.ms`.** A consumer wedged inside processing keeps
+  heartbeating and holds its partitions.
+- **Eager rebalancing only.** All consumption stops while a rebalance runs.
 - **No producer batching.** One message per request, so ~215 µs of broker work
   is paid per message. This — not the network — is what caps produce
   throughput. Phase 3.

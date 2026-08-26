@@ -33,6 +33,10 @@ negative latency.
 | 13 | Windows would have corrupted every byte offset | 2 | Anticipated |
 | 14 | Storage rewrite broke only the tests that deserved to | 2 | Design payoff |
 | 15 | Documentation links rotted silently | — | A script |
+| 16 | The reaper evicted members that were obeying the protocol | 4 | Three failing tests |
+| 17 | Generation bumped too early, giving the wrong error | 4 | A failing test |
+| 18 | A sequential driver cannot exercise a rendezvous | 4 | A chaos script that deadlocked |
+| 19 | `Consumer` wasn't thread-safe and didn't say so | 4 | The same chaos script |
 
 ---
 
@@ -466,6 +470,116 @@ after any doc restructuring.
 **What it taught.** Documentation has referential integrity just like code, and
 nothing checks it by default. If a class of error cannot announce itself, write
 the thing that makes it announce itself.
+
+---
+
+## 16. The reaper evicted members that were obeying the protocol
+
+**Phase 4 · [broker/coordinator.py](../broker/coordinator.py)**
+
+**What happened.** Three group tests failed with
+`UNKNOWN_MEMBER_ID: member ... was evicted during the rebalance` — raised from
+inside the very join the member was still waiting on.
+
+**Why.** The heartbeat thread starts only *after* `subscribe()` returns, and
+`subscribe()` blocks inside `JOIN_GROUP` until the rendezvous completes. So a
+member waiting in the rendezvous sends no heartbeats for the entire rebalance.
+With a session timeout (800 ms) shorter than the rebalance timeout (5 s), the
+reaper evicted members for doing exactly what the protocol told them to do.
+
+**The fix.** A member with a request **parked in the coordinator** is alive by
+definition — we are holding its connection open right now. `_expire_members`
+now skips members in `joined_members` while a rebalance is in progress. Real
+Kafka reasons the same way: an in-purgatory request counts as liveness.
+
+**What it taught.** Liveness detection has to account for the states your own
+protocol puts clients into. "No heartbeat" is not the same as "no evidence of
+life", and conflating them punished correct behaviour.
+
+---
+
+## 17. The generation bumped too early, giving the wrong error
+
+**Phase 4 · [broker/coordinator.py](../broker/coordinator.py)**
+
+**What happened.** A test expected a heartbeat during a rebalance to return
+`REBALANCE_IN_PROGRESS`. It returned `ILLEGAL_GENERATION`.
+
+**Why.** I incremented the generation in `begin_rebalance()`, at the *start*.
+So an existing member's next heartbeat carried a number that was already stale
+and failed the fencing check before it ever reached the state check.
+
+Both codes are actionable, so this looked harmless. It is not: they say
+different things. `ILLEGAL_GENERATION` means "you are a zombie, throw away your
+work"; `REBALANCE_IN_PROGRESS` means "the group is reorganising, rejoin". I had
+collapsed two distinct situations into the more alarming one.
+
+**The fix.** Bump the generation in `complete_join()`, once membership for the
+round is settled — which is what Kafka does. Fencing is unaffected, because it
+never depended on the early bump: an *evicted* member is removed from the
+membership dict and fails the membership check regardless of generation.
+
+**What it taught.** I had written a confident comment justifying the early bump
+("this is what fences the previous generation immediately"). It was wrong, and
+the test is what caught it. **A comment explaining why a design is right is not
+evidence that it is.**
+
+---
+
+## 18. A sequential driver cannot exercise a rendezvous
+
+**Phase 4 · [chaos/kill_consumer.py](../chaos/kill_consumer.py)**
+
+**What happened.** The chaos script showed every consumer stranded in its own
+generation — 7, 8 and 9 — each believing it owned all four partitions. The
+group never converged. Meanwhile a minimal two-consumer script converged
+perfectly in 230 ms, which meant the coordinator was fine and the script was
+not.
+
+**Why.** The script drove all consumers from one loop, polling them in turn.
+But **`JOIN_GROUP` blocks**: the coordinator holds it until every member has
+rejoined. So the driver entered alice's rejoin, alice waited for bob, and the
+driver never reached bob. The rendezvous timed out, dropped the absentees, and
+left each member alone.
+
+**The fix.** Give each consumer its own thread, which is how consumers actually
+run. It then converged immediately: all three in generation 3, four partitions,
+zero duplicates.
+
+**What it taught.** A rendezvous protocol requires genuinely concurrent
+participants — that is a property of the protocol, not of the harness. I also
+wasted two rounds theorising before writing the minimal reproduction that
+isolated it in one run. **When a complex case fails and you cannot see why,
+build the simplest case that should work.** If it works, the bug is in the
+difference.
+
+---
+
+## 19. `Consumer` was not thread-safe and did not say so
+
+**Phase 4 · [consumer/consumer.py](../consumer/consumer.py)**
+
+**What happened.** While debugging #18 the script hit
+`ProtocolError: Correlation mismatch: sent 2, got 1` — two threads using one
+`Consumer`, each reading the other's reply, exactly like the producer bug in #9.
+
+**The fix, and why it is not a lock that makes it work.** A non-blocking guard
+that raises immediately:
+
+> `Consumer is not thread-safe: poll() was called while another thread was
+> still using this consumer. Give each thread its own Consumer.`
+
+Serialising instead would have *hidden* a design error: two threads sharing a
+consumer also share its position and assignment, so even a perfectly safe
+connection would produce nonsense. Kafka's consumer does the same and calls it
+`ConcurrentModificationException`.
+
+**What it taught.** When misuse is possible, detecting it loudly beats making
+it silently sort-of-work — the same principle as #5 and #8. Note also that the
+producer needed a *lock* (its sender thread legitimately shares the socket)
+while the consumer needed a *refusal* (its heartbeat thread gets its own
+connection instead). The right answer depended on whether the sharing was
+legitimate.
 
 ---
 

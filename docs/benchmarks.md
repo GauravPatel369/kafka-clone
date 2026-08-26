@@ -26,7 +26,7 @@ comparison, not a regression. The p99 is the **caller's** cost: `send()`
 returns without sending, so it measures how long the application is blocked,
 not how long the message takes to reach disk. See below.
 | 3 — Partitioning | | | | | Batching + `linger.ms` → produce should jump ~10-50x |
-| 4 — Consumer groups | | | | | Server-side offsets; expect a small commit cost |
+| **4 — Consumer groups** | 45,082 | 0.03 | 102,594 | 1.40 | Coordinator, rebalancing, server-side offsets. **Throughput unchanged — the cost is a rebalance pause, measured below.** |
 | 5 — Cluster | | | | | Partitions across brokers |
 | 6 — Replication | | | | | `acks=all` will cost latency; that is the point |
 
@@ -281,6 +281,57 @@ The remaining produce ceiling is no longer per-message overhead; it is that
 records are appended one at a time inside the batch (`_append_records` loops)
 and the payload is still uncompressed JSON. Compression is the next big lever
 and we do not implement it.
+
+---
+
+## Phase 4: the cost is not throughput, it is a pause
+
+Consumer groups add no per-message work on the hot path, so produce and consume
+throughput are unchanged. Measuring them would tell you nothing.
+
+What groups actually cost is **availability during a rebalance**, and that is
+what `chaos/kill_consumer.py` measures:
+
+```
+three members, four partitions, converged:
+
+    alice   p3        generation 3
+    bob     p2        generation 3
+    carol   p0, p1    generation 3
+
+kill bob (no LEAVE_GROUP, session_timeout_ms = 800):
+
+    alice   p2, p3    generation 4
+    carol   p0, p1    generation 4      recovered in ~1.0 s
+```
+
+**~1.0 s of failover** with an 800 ms session timeout — detection dominates,
+and the rebalance itself is fast. That number is a direct function of a setting
+with no right answer:
+
+| `session.timeout.ms` | Effect |
+|---|---|
+| Short (800 ms, here) | Fast failover. A GC pause or network blip triggers a **spurious rebalance**, stopping consumption for the whole group. |
+| Kafka default (45 s) | Stable under hiccups. A genuinely dead consumer's partitions go unread for the better part of a minute. |
+
+And during any rebalance, **eager (stop-the-world) rebalancing stops all
+consumption**: every member revokes everything before anyone receives anything.
+Cooperative incremental rebalancing moves only what must move; we did not
+implement it, and this pause is the price.
+
+### The one number that did get worse
+
+`__consumer_offsets` has no compaction, so it grows with the number of commits
+rather than the number of live keys. A consumer committing once a second adds
+~86,000 records a day, and every one of them is replayed at broker startup.
+
+```bash
+python -m tools.kfk segments --topic __consumer_offsets
+```
+
+Compare the record count against the number of distinct
+`(group, topic, partition)` keys — the difference is exactly what compaction
+would reclaim, and the gap grows forever.
 
 ---
 
