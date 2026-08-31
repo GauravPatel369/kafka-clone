@@ -133,3 +133,34 @@ DEFAULT_POLL_INTERVAL = 1.0    # seconds to sleep when a poll returns nothing
 # `fetch.max.wait.ms` and answers the instant data arrives, giving low latency
 # AND no busy-waiting. We use the simple version for now; the trade-off is
 # real and worth noticing.
+
+# ── Cluster (Phase 5) ──────────────────────────────────────────
+
+# How often a broker heartbeats every peer in the roster.
+DEFAULT_BROKER_HEARTBEAT_MS = 500
+
+# How long a peer may go unheard from before it is considered down.
+#
+# Same dilemma as the consumer session timeout, one level up: short detects a
+# dead broker fast and turns a network blip into a leadership change (which
+# moves partitions and, until Phase 6, loses their data); long is stable and
+# leaves partitions unserved for longer.
+#
+# Set to several heartbeat intervals so a single dropped packet cannot
+# trigger a reassignment.
+DEFAULT_BROKER_SESSION_TIMEOUT_MS = 3000
+
+# How many applied Raft entries accumulate before a node snapshots its state
+# machine and discards the log prefix.
+#
+# Deliberately far above anything this cluster reaches: only CREATE_TOPIC and
+# ASSIGN_PARTITIONS are ever proposed, so a real log here has tens of entries,
+# not thousands. Snapshotting is a correctness-preserving optimisation for a
+# problem we do not yet have, and firing it constantly would spend fsyncs to
+# reclaim kilobytes.
+#
+# The consequence is that this code path would never run in a normal session,
+# which is its own hazard — see docs/phase-5/raft-snapshots.md §6. The tests
+# lower it to a handful so compaction actually happens under real elections
+# and real replication.
+DEFAULT_RAFT_SNAPSHOT_THRESHOLD = 1000

@@ -85,6 +85,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+from common.cluster_client import ClusterClient
 from common.config import (
     DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HOST, DEFAULT_MAX_MESSAGES,
     DEFAULT_POLL_INTERVAL, DEFAULT_PORT, DEFAULT_SESSION_TIMEOUT_MS,
@@ -93,7 +94,7 @@ from common.errors import (
     IllegalGenerationError, KafkaError, RebalanceInProgressError,
     UnknownMemberIdError, UnknownTopicOrPartitionError, raise_for_error,
 )
-from common.net import BrokerConnectionError, SyncConnection
+from common.net import BrokerConnectionError, SyncConnection  # noqa: F401
 from common.protocol import (
     API_FETCH, API_HEARTBEAT, API_JOIN_GROUP, API_LEAVE_GROUP,
     API_LIST_OFFSETS, API_METADATA, API_OFFSET_COMMIT, API_OFFSET_FETCH,
@@ -165,7 +166,10 @@ class Consumer:
         self.generation_id = -1
         self.is_leader = False
 
-        self._conn = SyncConnection(host, port)
+        # From Phase 5 the consumer talks to a CLUSTER. Fetches must go to
+        # whichever broker leads each assigned partition; group and offset APIs
+        # can go to any broker.
+        self._cluster = ClusterClient([(host, port)], timeout=30.0)
 
         # A SECOND connection, for the heartbeat thread only. Sharing one
         # socket between threads means eventually reading each other's replies
@@ -209,7 +213,7 @@ class Consumer:
     # ── Lifecycle ──────────────────────────────────────────────
 
     def connect(self) -> 'Consumer':
-        self._conn.connect()
+        self._cluster.refresh()
         topic, partition = self._initial
         if topic is not None:
             self.assign([(topic, partition)])
@@ -228,7 +232,7 @@ class Consumer:
 
         if self.subscription and self.member_id:
             try:
-                self._conn.request(API_LEAVE_GROUP, {
+                self._cluster.request_any(API_LEAVE_GROUP, {
                     'group_id': self.group_id, 'member_id': self.member_id})
             except (KafkaError, BrokerConnectionError):
                 # Best effort. Failing to leave cleanly costs a session
@@ -236,7 +240,7 @@ class Consumer:
                 # whatever the caller was actually shutting down for.
                 pass
 
-        self._conn.close()
+        self._cluster.close()
         self._heartbeat_conn.close()
 
     def __enter__(self) -> 'Consumer':
@@ -298,7 +302,7 @@ class Consumer:
         if not self.subscription or not self._need_rejoin.is_set():
             return
 
-        response = raise_for_error(self._conn.request(API_JOIN_GROUP, {
+        response = raise_for_error(self._cluster.request_any(API_JOIN_GROUP, {
             'group_id': self.group_id,
             'member_id': self.member_id,
             'topics': self.subscription,
@@ -322,8 +326,10 @@ class Consumer:
             # ships with your application and never touches a broker.
             subscriptions = {m['member_id']: m['topics']
                              for m in response['members']}
-            assignment = compute_assignment(
-                self.assignor, subscriptions, response.get('partition_counts', {}))
+            counts = response.get('partition_counts', {})
+            for topic in self.subscription:
+                counts.setdefault(topic, self._cluster.partition_count(topic))
+            assignment = compute_assignment(self.assignor, subscriptions, counts)
             sync_payload['assignments'] = {
                 member_id: [list(tp) for tp in partitions]
                 for member_id, partitions in assignment.items()
@@ -332,7 +338,7 @@ class Consumer:
                       f"{sum(len(v) for v in assignment.values())} partitions "
                       f"across {len(assignment)} member(s)")
 
-        sync = raise_for_error(self._conn.request(API_SYNC_GROUP, sync_payload))
+        sync = raise_for_error(self._cluster.request_any(API_SYNC_GROUP, sync_payload))
 
         with self._state_lock:
             self.assignment = [tuple(tp) for tp in sync['assignment']]
@@ -355,7 +361,7 @@ class Consumer:
             self.position, self.committed, self.high_watermark = {}, {}, {}
             return
 
-        response = raise_for_error(self._conn.request(API_OFFSET_FETCH, {
+        response = raise_for_error(self._cluster.request_any(API_OFFSET_FETCH, {
             'group_id': self.group_id,
             'partitions': [{'topic': t, 'partition': p} for t, p in self.assignment],
         }))
@@ -489,10 +495,14 @@ class Consumer:
 
     def _fetch_one(self, topic: str, partition: int, max_messages: int) -> list:
         tp = (topic, partition)
-        response = self._conn.request(API_FETCH, {
-            'topic': topic, 'partition': partition,
-            'offset': self.position.get(tp, 0), 'max': max_messages,
-        })
+        # Routed to the LEADER of this partition, with refresh-and-retry on
+        # NOT_LEADER_OR_FOLLOWER. From Phase 5 a consumer's assigned partitions
+        # can live on different brokers, so "the broker" is no longer a thing.
+        response = self._cluster.request_for_partition(
+            topic, partition, API_FETCH, {
+                'topic': topic, 'partition': partition,
+                'offset': self.position.get(tp, 0), 'max': max_messages,
+            })
         raise_for_error(response, topic=topic, partition=partition,
                         offset=self.position.get(tp, 0))
 
@@ -509,8 +519,9 @@ class Consumer:
 
     def _list_offset(self, tp: tuple, timestamp: int) -> int:
         topic, partition = tp
-        response = self._conn.request(API_LIST_OFFSETS, {
-            'topic': topic, 'partition': partition, 'timestamp': timestamp})
+        response = self._cluster.request_for_partition(
+            topic, partition, API_LIST_OFFSETS,
+            {'topic': topic, 'partition': partition, 'timestamp': timestamp})
         try:
             raise_for_error(response, topic=topic, partition=partition)
         except UnknownTopicOrPartitionError:
@@ -551,7 +562,7 @@ class Consumer:
             payload['generation_id'] = self.generation_id
 
         try:
-            raise_for_error(self._conn.request(API_OFFSET_COMMIT, payload))
+            raise_for_error(self._cluster.request_any(API_OFFSET_COMMIT, payload))
         except (IllegalGenerationError, UnknownMemberIdError):
             # We are a zombie: evicted, and our partitions belong to someone
             # else now. Rejoin rather than retrying the commit — the work we

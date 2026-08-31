@@ -43,7 +43,8 @@ from common.config import (
 from common.errors import ERROR_NAMES, KafkaError, raise_for_error
 from common.net import BrokerConnectionError, SyncConnection
 from common.protocol import (
-    API_CREATE_TOPICS, API_DESCRIBE_GROUPS as API_DESCRIBE_GROUP,
+    API_CREATE_TOPICS, API_DESCRIBE_CLUSTER,
+    API_DESCRIBE_GROUPS as API_DESCRIBE_GROUP,
     API_FETCH, API_LIST_GROUPS, API_LIST_OFFSETS, API_METADATA,
     API_OFFSET_FETCH, TIMESTAMP_EARLIEST, TIMESTAMP_LATEST,
 )
@@ -453,6 +454,55 @@ def cmd_groups_describe(args) -> int:
     return 0
 
 
+def cmd_cluster_status(args) -> int:
+    """
+    Membership, controller, and where every partition lives.
+
+    Answers the three questions you actually have when a cluster misbehaves:
+    who is up, who is in charge, and which broker holds the partition I care
+    about.
+    """
+    response = _request(args, API_DESCRIBE_CLUSTER, {})
+
+    print(f"Answering broker : {response['node_id']}")
+    print(f"Controller       : {response['controller_id']}")
+    print(f"Metadata version : {response['metadata_version']}\n")
+
+    print(f"  {'BROKER':<9}{'ADDRESS':<24}{'STATE':<9}ROLE")
+    for entry in response['brokers']:
+        role = 'controller' if entry['node_id'] == response['controller_id'] else ''
+        state = 'up' if entry['alive'] else 'DOWN'
+        print(f"  {entry['node_id']:<9}{entry['host'] + ':' + str(entry['port']):<24}"
+              f"{state:<9}{role}")
+
+    partitions = response['partitions']
+    if not partitions:
+        print("\n  No partitions assigned yet.")
+        return 0
+
+    by_broker = {}
+    for entry in partitions:
+        by_broker.setdefault(entry['leader'], []).append(
+            f"{entry['topic']}-{entry['partition']}")
+
+    print(f"\n  {'BROKER':<9}{'PARTITIONS LED':<10}")
+    for node_id in sorted(by_broker):
+        owned = by_broker[node_id]
+        print(f"  {node_id:<9}{len(owned):<10}{', '.join(owned[:6])}"
+              + (' ...' if len(owned) > 6 else ''))
+
+    down = set(response['down_brokers'])
+    stranded = [p for p in partitions if p['leader'] in down]
+    if stranded:
+        print(f"\n  ⚠ {len(stranded)} partition(s) are assigned to a DOWN broker.")
+    if len(response['live_brokers']) < len(response['known_brokers']):
+        print(f"\n  Note: {len(down)} broker(s) down. Their partitions have been "
+              f"\n  reassigned — but their DATA has not moved. Until replication "
+              f"\n  (Phase 6), a reassigned partition starts empty on its new "
+              f"\n  leader.")
+    return 0
+
+
 def cmd_offsets(args) -> int:
     """
     List every committed consumer offset on this machine.
@@ -542,6 +592,11 @@ def main() -> int:
     p.add_argument('--topic', required=True)
     p.add_argument('--partition', type=int, default=0)
     p.set_defaults(func=cmd_segments)
+
+    cluster = sub.add_parser('cluster', help='membership, controller, placement')
+    cluster_sub = cluster.add_subparsers(dest='cluster_command', required=True)
+    c = cluster_sub.add_parser('status', help='who is up, who leads what')
+    c.set_defaults(func=cmd_cluster_status)
 
     groups = sub.add_parser('groups', help='list and describe consumer groups')
     groups_sub = groups.add_subparsers(dest='groups_command', required=True)

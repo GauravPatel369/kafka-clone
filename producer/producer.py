@@ -54,10 +54,11 @@ import random
 import threading
 import time
 
+from common.cluster_client import ClusterClient
 from common.config import DEFAULT_HOST, DEFAULT_PORT
 from common.errors import KafkaError, RetriableError, error_for_code, raise_for_error
-from common.net import BrokerConnectionError, SyncConnection
-from common.protocol import API_METADATA, API_PRODUCE
+from common.net import BrokerConnectionError
+from common.protocol import API_PRODUCE
 from producer.batch import RecordAccumulator, Sender
 from producer.partitioner import DefaultPartitioner
 
@@ -102,7 +103,11 @@ class Producer:
         self.retry_backoff_ms = retry_backoff_ms
         self.max_backoff_ms = max_backoff_ms
 
-        self._conn = SyncConnection(host, port)
+        # From Phase 5 the producer talks to a CLUSTER, not a broker. The
+        # ClusterClient owns one connection per broker plus the metadata cache,
+        # and routes each partition's batch to whichever broker leads it —
+        # including the refresh-and-retry when that map goes stale.
+        self._cluster = ClusterClient([(host, port)], timeout=30.0)
 
         # CONCEPT: one socket, two threads — and why this lock is mandatory.
         #
@@ -142,7 +147,7 @@ class Producer:
     # ── Lifecycle ──────────────────────────────────────────────
 
     def connect(self) -> 'Producer':
-        self._conn.connect()
+        self._cluster.refresh()
         self._sender = Sender(self._accumulator, self._send_batches)
         self._sender.start()
         self._log(f"connected to broker at {self.host}:{self.port} "
@@ -164,7 +169,7 @@ class Producer:
             finally:
                 self._sender.stop()
                 self._sender = None
-        self._conn.close()
+        self._cluster.close()
 
     def __enter__(self) -> 'Producer':
         return self.connect()
@@ -263,6 +268,33 @@ class Producer:
                     batch.fail(exc)
 
     def _send_topic_batches(self, topic: str, batches: list) -> None:
+        """
+        Ship one topic's batches, grouped by the broker that leads them.
+
+        CONCEPT: batching is now bounded by leadership.
+          Phase 3 sent every partition of a topic in one request, because there
+          was one broker. Now partition 0 may live on broker 1 and partition 3
+          on broker 2 — so a request can only carry the partitions its
+          recipient actually leads.
+
+          That is a real cost of distributing: fewer partitions per request
+          means less amortisation. A 6-partition topic on 3 brokers gets 3
+          requests where it used to get 1. Kafka pays exactly this, and it is
+          part of why partition counts and broker counts are tuned together.
+        """
+        by_leader = {}
+        for batch in batches:
+            try:
+                leader = self._cluster.leader_for(topic, batch.partition)
+            except KafkaError as exc:
+                batch.fail(exc)
+                continue
+            by_leader.setdefault(leader, []).append(batch)
+
+        for leader, leader_batches in by_leader.items():
+            self._send_to_leader(topic, leader, leader_batches)
+
+    def _send_to_leader(self, topic: str, leader: int, batches: list) -> None:
         payload = {
             'topic': topic,
             'acks': self.acks,
@@ -272,7 +304,7 @@ class Producer:
             ],
         }
 
-        response = self._request_with_retries(payload)
+        response = self._request_with_retries(topic, batches[0].partition, payload)
 
         if response is None:
             # acks=0: no reply exists, so there is no offset to report and no
@@ -301,7 +333,7 @@ class Producer:
             else:
                 batch.complete(entry['base_offset'])
 
-    def _request_with_retries(self, payload: dict):
+    def _request_with_retries(self, topic: str, partition: int, payload: dict):
         """
         Send one PRODUCE request, retrying retriable failures.
 
@@ -327,11 +359,19 @@ class Producer:
                         # No reply is coming, so do not read one. The
                         # connection stays in sync because the broker
                         # genuinely sends nothing back.
-                        self._conn.send_request(API_PRODUCE, payload,
-                                                PRODUCE_VERSION_BATCHED)
+                        #
+                        # acks=0 forfeits leader routing too: with no response
+                        # there is no NOT_LEADER to learn from, so a message
+                        # sent to a stale leader is simply lost. That is the
+                        # semantic, not an oversight — you asked not to be told.
+                        node_id = self._cluster.leader_for(topic, partition)
+                        self._cluster.connection_for(node_id).send_request(
+                            API_PRODUCE, payload, PRODUCE_VERSION_BATCHED)
                         return None
-                    return self._conn.request(API_PRODUCE, payload,
-                                              PRODUCE_VERSION_BATCHED)
+
+                    return self._cluster.request_for_partition(
+                        topic, partition, API_PRODUCE, payload,
+                        PRODUCE_VERSION_BATCHED)
 
             except (RetriableError, BrokerConnectionError) as exc:
                 if attempt >= self.retries:
@@ -345,56 +385,41 @@ class Producer:
                 attempt += 1
 
                 if isinstance(exc, BrokerConnectionError):
-                    # The socket is gone; a retry on it would fail identically.
+                    # The broker we reached is gone. Drop the cached map so the
+                    # retry re-resolves the leader rather than dialling the
+                    # same dead address again.
                     with self._conn_lock:
-                        self._conn.close()
-                        self._conn.connect()
+                        self._cluster.invalidate()
 
     # ── Metadata ───────────────────────────────────────────────
 
     def _num_partitions(self, topic: str) -> int:
         """
-        How many partitions this topic has, cached after the first lookup.
+        How many partitions this topic has, cached by the ClusterClient.
 
         The cache is why a producer can route a message without a network round
-        trip. It is also why a client can be WRONG after a topic changes —
-        which is the general shape of every metadata cache, and the reason
-        Phase 5's failover works by invalidating this on an error rather than
-        by polling.
+        trip, and why a client can be WRONG after a topic changes — the general
+        shape of every metadata cache, and the reason failover works by
+        invalidating on an error rather than by polling.
+
+        `allow_auto_create` matters: without it a brand-new topic answers "does
+        not exist", we fall back to 1, and every keyed message goes to
+        partition 0 — then the first PRODUCE creates it at its real width and
+        the cached 1 is wrong. Real Kafka producers set exactly this flag.
         """
         cached = self._partition_counts.get(topic)
         if cached is not None:
             return cached
 
-        # `allow_auto_topic_creation` matters more than it looks. Without it,
-        # a brand-new topic answers "does not exist", we fall back to 1, and
-        # every keyed message goes to partition 0 — then the first PRODUCE
-        # auto-creates the topic at its real width and our cached 1 is wrong.
-        # Asking metadata to create it first means the count we cache is the
-        # real one. Real Kafka producers set exactly this flag.
         with self._conn_lock:
-            response = self._conn.request(
-                API_METADATA,
-                {'topics': [topic], 'allow_auto_topic_creation': True})
-        raise_for_error(response, topic=topic)
-
-        for entry in response.get('topics', []):
-            if entry['name'] == topic and entry.get('error_code', 0) == 0:
-                count = len(entry['partitions'])
-                if count:
-                    self._partition_counts[topic] = count
-                    return count
-
-        # The topic genuinely does not exist and auto-creation is off on the
-        # broker. Assume one partition rather than failing here: the PRODUCE
-        # will return a proper UNKNOWN_TOPIC_OR_PARTITION, which is a much
-        # better error than one raised from a metadata lookup the caller did
-        # not know was happening.
-        return 1
+            count = self._cluster.partition_count(topic, allow_auto_create=True)
+        self._partition_counts[topic] = count
+        return count
 
     def refresh_metadata(self) -> None:
-        """Drop the cache so the next send re-reads partition counts."""
+        """Drop both caches so the next send re-reads counts and leaders."""
         self._partition_counts.clear()
+        self._cluster.invalidate()
 
     # ── Internals ──────────────────────────────────────────────
 

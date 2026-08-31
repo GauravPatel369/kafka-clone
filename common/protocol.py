@@ -138,6 +138,21 @@ API_SYNC_GROUP = 14
 API_DESCRIBE_GROUPS = 15
 API_LIST_GROUPS = 16
 
+# ── Cluster (Phase 5) ──────────────────────────────────────────
+# Real Kafka's inter-broker traffic belongs to KRaft's own protocol, so these
+# numbers are ours: chosen to sit clear of the client API range above.
+# Raft, for the controller quorum. Kafka's KRaft `Vote` really is 52; its
+# replication is pull-based (followers Fetch) so it has no AppendEntries, and
+# 53 is our own choice for classic push-based Raft.
+API_REQUEST_VOTE = 52          # candidate -> voter: "elect me for term T"
+API_APPEND_ENTRIES = 53        # leader -> follower: replication AND heartbeat
+API_INSTALL_SNAPSHOT = 54      # leader -> follower: "your entries are gone;
+                               # here is the state instead"
+
+API_BROKER_HEARTBEAT = 27      # broker -> peer: "I am alive"
+API_CONTROLLER_UPDATE = 28     # controller -> peer: "here is the new map"
+API_DESCRIBE_CLUSTER = 29      # client -> any broker: for `kfk cluster status`
+
 API_NAMES = {
     API_PRODUCE: 'PRODUCE',
     API_FETCH: 'FETCH',
@@ -153,6 +168,12 @@ API_NAMES = {
     API_DESCRIBE_GROUPS: 'DESCRIBE_GROUPS',
     API_LIST_GROUPS: 'LIST_GROUPS',
     API_CREATE_TOPICS: 'CREATE_TOPICS',
+    API_BROKER_HEARTBEAT: 'BROKER_HEARTBEAT',
+    API_CONTROLLER_UPDATE: 'CONTROLLER_UPDATE',
+    API_DESCRIBE_CLUSTER: 'DESCRIBE_CLUSTER',
+    API_REQUEST_VOTE: 'REQUEST_VOTE',
+    API_APPEND_ENTRIES: 'APPEND_ENTRIES',
+    API_INSTALL_SNAPSHOT: 'INSTALL_SNAPSHOT',
 }
 
 # What this broker can actually speak: api_key → (min_version, max_version).
@@ -184,6 +205,12 @@ SUPPORTED_VERSIONS = {
     API_SYNC_GROUP: (0, 0),
     API_DESCRIBE_GROUPS: (0, 0),
     API_LIST_GROUPS: (0, 0),
+    API_BROKER_HEARTBEAT: (0, 0),
+    API_CONTROLLER_UPDATE: (0, 0),
+    API_DESCRIBE_CLUSTER: (0, 0),
+    API_REQUEST_VOTE: (0, 0),
+    API_APPEND_ENTRIES: (0, 0),
+    API_INSTALL_SNAPSHOT: (0, 0),
 }
 
 # ── LIST_OFFSETS timestamp sentinels (Kafka's real values) ─────

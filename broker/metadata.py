@@ -256,6 +256,36 @@ class MetadataStore:
         """Return the config, or None. Never creates."""
         return self.topics.get(name)
 
+    def ensure_topic(self, name: str, partitions: int,
+                     replication_factor: int = 1) -> bool:
+        """
+        Adopt a topic definition learned from the controller. True if changed.
+
+        CONCEPT: topic metadata has to travel with the leader map.
+          The controller pushes which broker leads which partition. That is
+          useless to a peer that does not know the topic EXISTS, or that thinks
+          it has one partition when it has six.
+
+          This was a real bug, and it only showed up on failover: broker 1
+          created `orders` with 6 partitions; brokers 2 and 3 auto-created it
+          with 1 when a produce arrived. When broker 1 died, the new controller
+          recomputed placement from its own metadata and assigned exactly ONE
+          partition. Five partitions silently vanished from the cluster.
+
+          A widening (1 → 6) is accepted: that is the controller correcting our
+          under-informed guess. A NARROWING is refused — losing partitions
+          would strand their data and remap every key, and no legitimate flow
+          produces one.
+        """
+        existing = self.topics.get(name)
+        if existing is not None and existing.partitions >= partitions:
+            return False
+
+        self.topics[name] = TopicConfig(partitions=partitions,
+                                        replication_factor=replication_factor)
+        self._save()
+        return True
+
     def exists(self, name: str) -> bool:
         return name in self.topics
 

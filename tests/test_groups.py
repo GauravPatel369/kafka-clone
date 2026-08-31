@@ -447,7 +447,7 @@ def test_a_dead_member_is_evicted_and_its_partitions_reassigned(group_broker):
         # Kill the victim: stop heartbeating without leaving cleanly, which is
         # what a `kill -9` looks like to the coordinator.
         victim._stop_heartbeat()
-        victim._conn.close()
+        victim._cluster.close()
 
         deadline = time.time() + 10
         while time.time() < deadline:
