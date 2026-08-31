@@ -25,7 +25,7 @@ wrong, and that you understand the mechanism. That is what is being tested.
 
 ### Be honest about what is built
 
-**Built: Phases 0 through 4.**
+**Built: Phases 0 through 5.**
 
 | Phase | What it added |
 |---|---|
@@ -34,15 +34,22 @@ wrong, and that you understand the mechanism. That is what is being tested.
 | 2 | Storage engine: segments, sparse index, CRC32, retention |
 | 3 | Partitioning: murmur2 key routing, batching, `acks`, retries |
 | 4 | Consumer groups: coordinator, rebalancing, generation fencing, server-side offsets |
+| 5 | Cluster: membership, **Raft** controller election, replicated metadata, client routing |
 
-**Designed but not built: Phases 5–7** — multi-broker clustering, controller
-election, replication and ISR.
+**Designed but not built: Phases 6–7** — partition-data replication, ISR, the
+high watermark, and leader-epoch fencing.
 
-Say so. "I've implemented through Phase 4; clustering and replication are
-designed and documented but not written yet" is a completely respectable
-answer, and it is the one that survives a follow-up question. Claiming
-replication you have not built collapses the moment someone asks how you handle
-the high watermark, and everything you *did* build loses credibility with it.
+Say so, and be precise about the boundary, because Phase 5 makes it easy to
+overclaim. **Raft replicates metadata, not data.** The cluster now agrees on
+*who leads which partition* and cannot elect two controllers during a network
+partition — but the partitions themselves have one copy, so killing a broker
+still loses its data. "Consensus on the control plane, no replication on the
+data plane" is the sentence, and `chaos/kill_controller.py` prints exactly that
+outcome.
+
+Claiming replication you have not built collapses the moment someone asks how
+you handle the high watermark, and everything you *did* build loses credibility
+with it.
 
 **Also flag the honest gaps inside what IS built**, because they are the
 questions an interviewer will find anyway: `__consumer_offsets` has no
@@ -565,9 +572,43 @@ Quorum consensus prevents it: a leader needs a **majority**, and a minority
 partition mathematically cannot form one. Plus **fencing** — epoch/term numbers
 mean a stale leader's writes are rejected once a new epoch exists.
 
-> Good honest framing: "My design uses lowest-live-ID election because it's the
-> clearest teaching path. I documented that it's split-brain-prone under a
-> network partition and what Raft adds — quorum, terms, fencing."
+> Good honest framing: "I built lowest-live-ID election first, on purpose, and
+> wrote a chaos script that partitions the network. It printed two controllers
+> assigning the same six partitions differently, with no error anywhere. Then I
+> replaced the election with Raft — leader election with the up-to-date-log
+> restriction, log replication with the current-term commit rule, and durable
+> `currentTerm`/`votedFor` — and the same script now prints one controller and
+> a minority that sits as candidates, unable to elect. What it still does NOT
+> fix is the data plane: a stale broker will accept a write for a partition it
+> no longer leads, because that needs leader-epoch fencing."
+
+That last sentence is the one worth rehearsing. Knowing precisely where your
+own guarantee stops is more convincing than the guarantee.
+
+### Q: What actually goes wrong when you implement Raft yourself?
+
+A question worth having a real answer to, because "I read the paper" and "I
+have run it with a node down" sound identical until this one.
+
+The safety rules — terms, the election restriction, the Figure 8 current-term
+commit rule — are written down and can be implemented from the paper. The bugs
+were all in **timing**, and every one of them was the same mistake: *waiting
+for the slowest peer.*
+
+A dead peer is not silent, it is slow — it costs a full RPC timeout, every
+time. So any code that waits on all peers runs at the pace of the worst one. In
+this project that appeared four times, and the compound effect was that two
+healthy brokers out of three could not keep a leader elected: the vote tally
+discarded a granted vote as stale, and the heartbeat interval stretched past
+the followers' election timeout, so a healthy leader was deposed roughly once a
+second, forever. Raft stayed *safe* the whole time — never two leaders — and
+nothing ever committed.
+
+None of it showed up in the unit tests, because the in-memory transport
+modelled a dead node as instant silence. Cheap, obvious, and wrong.
+
+> "The algorithm is the easy half. The hard half is that failure detection is
+> made of timers, and a timer that waits on a broken thing is a broken timer."
 
 ### Q: How do you keep a client working when a broker dies?
 

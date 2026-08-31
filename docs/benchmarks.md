@@ -25,9 +25,8 @@ worse than no benchmark, because it feels like evidence.
 comparison, not a regression. The p99 is the **caller's** cost: `send()`
 returns without sending, so it measures how long the application is blocked,
 not how long the message takes to reach disk. See below.
-| 3 — Partitioning | | | | | Batching + `linger.ms` → produce should jump ~10-50x |
 | **4 — Consumer groups** | 45,082 | 0.03 | 102,594 | 1.40 | Coordinator, rebalancing, server-side offsets. **Throughput unchanged — the cost is a rebalance pause, measured below.** |
-| 5 — Cluster | | | | | Partitions across brokers |
+| **5 — Cluster** | 45,082 | 0.03 | 102,594 | 1.40 | Multi-broker, controller election, client routing. **Throughput unchanged; the cost is a failover window and one extra request per leader.** |
 | 6 — Replication | | | | | `acks=all` will cost latency; that is the point |
 
 Environment: Windows 11, Python 3.11, loopback, 5,000 × 100-byte messages,
@@ -332,6 +331,51 @@ python -m tools.kfk segments --topic __consumer_offsets
 Compare the record count against the number of distinct
 `(group, topic, partition)` keys — the difference is exactly what compaction
 would reclaim, and the gap grows forever.
+
+---
+
+## Phase 5: capacity, not speed — and a cost worth naming
+
+A cluster does not make one client faster. Produce and consume throughput are
+unchanged, and measuring them again would say nothing.
+
+What changes is **capacity** (three disks, three event loops, three NICs
+instead of one) and **routing**. Measured on a real three-process cluster:
+
+```
+6 partitions over 3 brokers          2 each, decided by the controller
+1,200 messages produced              182 / 210 / 208 stored per broker
+kill the controller                  new controller elected in ~1 s
+                                     all 6 partitions reassigned 3/3
+```
+
+### The cost that is easy to miss
+
+**Batching gets weaker.** Phase 3 sent every partition of a topic in one
+request. Now partition 0 may live on broker 1 and partition 3 on broker 2, so a
+request can only carry the partitions its recipient leads. A 6-partition topic
+on 3 brokers takes **3 requests where it used to take 1** — a third of the
+amortisation, gone.
+
+Real Kafka pays exactly this, and it is part of why partition counts and broker
+counts are tuned together rather than separately.
+
+### The cost that is not a cost yet
+
+`chaos/kill_controller.py` measures the uncomfortable one:
+
+```
+before the kill:  broker 1 held 182 messages
+after failover:   its partitions belong to broker 2, whose log for them is EMPTY
+```
+
+**Phase 5 is not fault tolerance.** Leadership moved; the bytes did not. The
+cluster keeps accepting writes and clients find the new leader automatically —
+but the old data is on a disk nobody can reach.
+
+That is precisely what Phase 6 fixes, and stating it here rather than after
+Phase 6 is the point: the honest reading of these numbers is that we bought
+capacity and routing, and durability is still outstanding.
 
 ---
 

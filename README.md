@@ -40,7 +40,7 @@ and code for each step.
 
 Want the wrong turns rather than the clean result?
 **[docs/challenges-and-solutions.md](docs/challenges-and-solutions.md)** is the
-development journal: nineteen real bugs, wrong predictions, and design dead
+development journal: twenty-eight real bugs, wrong predictions, and design dead
 ends — what broke, how it was caught, and what fixed it.
 
 ---
@@ -78,6 +78,9 @@ python -m chaos.kill_consumer_midprocess   # watch at-most-once lose data
 python -m chaos.corrupt_log                # watch CRCs catch three kinds of damage
 python -m chaos.partition_balance          # watch load balancing and its cost
 python -m chaos.kill_consumer              # kill a consumer, watch failover + fencing
+python -m chaos.kill_controller            # kill the controller, watch re-election
+python -m chaos.split_brain                # partition the network, count the controllers
+python -m chaos.lagging_follower           # compact past a follower, watch InstallSnapshot rescue it
 python -m bench.bench --count 20000        # throughput, percentiles, seek profile
 pytest -q                                  # the test suite
 ```
@@ -91,7 +94,7 @@ in ~1 s, then shows the "dead" consumer coming back and being refused.
 
 ---
 
-## Architecture today (end of Phase 4)
+## Architecture today (end of Phase 5)
 
 ```
    ┌──────────┐                                    ┌──────────┐
@@ -108,6 +111,14 @@ in ~1 s, then shows the "dead" consumer coming back and being refused.
   keyed by group|topic|partition                 ├── 00000000000000000000.index
                                                  └── 00000000000000011640.log  ACTIVE
 ```
+
+Several brokers form a cluster from a static `cluster.json`. They heartbeat
+each other, and a **Raft quorum** elects one of them as the **controller**.
+The controller assigns each partition to a broker — but proposes that decision
+to the quorum and applies it only once a majority has committed it, then pushes
+the committed map to its peers. A broker refuses a
+partition it does not lead with `NOT_LEADER_OR_FOLLOWER`, and the client
+refreshes its metadata and retries — that pair *is* client-side failover.
 
 Consumers sharing a `group_id` form a group: the coordinator divides the
 topic's partitions among them, one member each, and reassigns when a member
@@ -147,8 +158,8 @@ clients decide what to retry without parsing English.
 | **2** | [Storage engine](docs/phase-2/phase-2-storage.md) | Segments, sparse index, CRC32, retention, truncation | ✅ done |
 | **3** | [Partitioning](docs/phase-3/phase-3-partitioning.md) | Key hashing, batching, `acks`, retries, PRODUCE v1 — **load balancing** | ✅ done |
 | **4** | [Consumer groups](docs/phase-4/phase-4-consumer-groups.md) | Coordinator, rebalancing, generation fencing, server-side offsets | ✅ done |
-| 5 | Cluster | Multi-broker, membership, controller election, metadata routing | next |
-| 6 | Replication | Leader/follower, ISR, high watermark, failover — **fault tolerance** | |
+| **5** | [Cluster](docs/phase-5/phase-5-cluster.md) | Multi-broker, membership, **Raft** controller election, client routing | ✅ done |
+| 6 | Replication | Leader/follower, ISR, high watermark, failover — **fault tolerance** | next |
 | 7 | Capstone | Full demo, benchmark table, honest limitations | |
 
 Every phase is runnable on its own. Check out any phase's final commit and the
@@ -170,10 +181,19 @@ system works.
 
 ```
 common/     protocol.py   wire format: encode/decode
+            cluster_config.py  the static broker roster
+            cluster_client.py  client routing, metadata cache, failover
             net.py        SyncConnection — framed client transport
             config.py     every default in one place
             errors.py     numeric error codes, retriable or not
 broker/     broker.py     asyncio TCP server, request routing
+            cluster.py    membership, liveness, the local leader map
+            controller.py placement, proposed through Raft
+            raft/         state.py    durable currentTerm and votedFor
+                          log.py      the replicated log, election restriction
+                          node.py     follower / candidate / leader
+                          machine.py  what a committed entry means
+                          snapshot.py compaction: the answer without the journal
             metadata.py   which topics exist and how wide they are
             coordinator.py group membership, generations, liveness
             offset_store.py __consumer_offsets
@@ -200,16 +220,36 @@ docs/       00-overview.md          concepts, before any code
             phase-2/                storage engine
             phase-3/                partitioning + batching
             phase-4/                consumer groups
+            phase-5/                the cluster + Raft snapshots
 ```
 
 ---
 
-## Known limitations at Phase 0
+## Known limitations at Phase 5
 
 Stated plainly, because a system that only lists its strengths is a sales
 pitch:
 
-- **One broker.** Partitions exist, but they all live on one machine — Phase 5.
+- **Losing a broker loses its data.** Partitions are spread across brokers but
+  not replicated: a reassigned partition starts empty on its new leader.
+  Phase 6.
+- **No leader epoch fencing.** Raft fixed the *control* plane: a minority can
+  no longer elect a controller, so two brokers cannot both decide who leads a
+  partition. It did not fix the *data* plane — a stale broker will still accept
+  a write for a partition it no longer leads. Phase 6 adds the fencing, using
+  the Raft term as the epoch. `chaos/split_brain.py` shows exactly where the
+  guarantee stops.
+- **Snapshots are unchunked and never fire by default.** The Raft log is
+  compacted, restart replays snapshot-plus-tail, and a follower that falls off
+  the back is caught up with `InstallSnapshot`
+  ([Step A](docs/phase-5/raft-snapshots.md) ·
+  [Step B](docs/phase-5/raft-install-snapshot.md)). Two honest gaps: a snapshot
+  is sent in one message, which caps the cluster at about 190,000 partitions
+  (measured); and the threshold is set far above anything this cluster reaches,
+  so `chaos/lagging_follower.py` is the only thing that runs the mechanism
+  outside its unit tests.
+- **The quorum is fixed at startup.** Raft can reconfigure its voter set
+  through its own log (joint consensus); ours cannot.
 - **No compression.** Real Kafka compresses a batch as a unit, which is where
   batching's *other* big win comes from. The remaining produce ceiling is
   largely uncompressed JSON.

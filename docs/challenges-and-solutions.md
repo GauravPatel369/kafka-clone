@@ -37,6 +37,10 @@ negative latency.
 | 17 | Generation bumped too early, giving the wrong error | 4 | A failing test |
 | 18 | A sequential driver cannot exercise a rendezvous | 4 | A chaos script that deadlocked |
 | 19 | `Consumer` wasn't thread-safe and didn't say so | 4 | The same chaos script |
+| 20 | `METADATA` only ever reported itself | 5 | A chaos script reporting 0 stored |
+| 21 | The roster recorded port 0 | 5 | 30 tests timing out at once |
+| 22 | `CREATE_TOPICS` waited on an unreachable peer | 5 | One test timing out |
+| 23 | Topic metadata never replicated — partitions vanished on failover | 5 | Running it by hand |
 
 ---
 
@@ -583,6 +587,295 @@ legitimate.
 
 ---
 
+## 20. `METADATA` only ever reported itself
+
+**Phase 5 · [broker/broker.py](../broker/broker.py)**
+
+**What happened.** The chaos script printed
+`messages stored per broker: b1=0 b2=0 b3=0 — total: 0` after producing 600
+messages.
+
+**Why, twice over.** `_handle_metadata` returned
+`'brokers': [{'node_id': self.node_id, ...}]` — only itself. A client
+bootstrapping to broker 1 learned that partitions lived on brokers 2 and 3, and
+then had no address for either. Every send failed.
+
+And **the script never noticed**, because it called `producer.send()` 600 times
+and inspected none of the returned futures. A future nobody inspects is an
+error nobody sees — which is the entire reason `get()` re-raises.
+
+**The fix.** `'brokers': self.cluster_config.as_list()`, and the script now
+checks every future and prints a failure count.
+
+**What it taught.** Two failures compounding: the code was wrong, and the
+harness was built so it could not tell. The second is the more dangerous habit
+— I had written the "check your futures" lesson into the Phase 3 docs and then
+did not do it.
+
+---
+
+## 21. The roster recorded port 0
+
+**Phase 5 · [broker/broker.py](../broker/broker.py)**
+
+**What happened.** Fixing #20 immediately broke **30 tests**, most of them by
+timing out.
+
+**Why.** Tests start brokers with `port=0` — "OS, pick a free port" — and read
+the real port back after binding. But `ClusterConfig.single_node(node_id, host,
+port)` is built in `__init__`, *before* `start()` binds. So the roster recorded
+port **0**, `METADATA` handed that to clients, and clients dutifully dialled
+port 0 and hung until their socket timeout.
+
+**The fix.** Correct the roster entry in `start()`, right after the real port is
+known.
+
+**What it taught.** A value that is only knowable *after* construction cannot be
+captured *during* it. The bug was latent from the moment the roster was added
+and invisible until something actually read it — the fix for #20 did not cause
+it, it revealed it.
+
+---
+
+## 22. `CREATE_TOPICS` waited on an unreachable peer
+
+**Phase 5 · [broker/broker.py](../broker/broker.py)**
+
+**What happened.** A test's setup line — a plain `CREATE_TOPICS` — timed out.
+
+**Why.** Creating a topic triggers `_refresh_placement()`, which **awaited**
+`_push_controller_update()`, which tried to connect to every peer. With one
+peer unreachable, the client's request sat behind a full connect timeout.
+
+**The fix.** Fire the broadcast as a background task. The push is something the
+controller owes its peers, not part of the requester's transaction.
+
+**What it taught.** One dead broker was causing a **cluster-wide latency
+problem** rather than a local one — the shape of a cascading failure, in
+miniature. Also: `asyncio` keeps only a weak reference to tasks, so a
+fire-and-forget task needs a strong reference or it can be collected
+mid-flight.
+
+The consequence is real and had to be tested for: peers now converge *shortly
+after* a change rather than instantly, so `test_partitions_are_spread_across_the_cluster`
+polls until they agree. A peer that has not caught up answers NOT_LEADER, and
+the client refreshes — the gap is covered, not hidden.
+
+---
+
+## 23. Topic metadata never replicated — partitions vanished on failover
+
+**Phase 5 · [broker/metadata.py](../broker/metadata.py)**
+
+**What happened.** Running a real three-process cluster by hand: create
+`orders` with 6 partitions, produce, kill broker 1. `kfk cluster status` on
+broker 2 showed **one** partition led, total. Five had disappeared.
+
+**Why.** The controller pushed the *leader map* but not the *topic list*.
+Broker 1 knew `orders` had 6 partitions; brokers 2 and 3 auto-created it with 1
+when a produce arrived. When broker 1 died, the new controller recomputed
+placement from **its own** metadata — which said one partition.
+
+**The fix.** Ship topic definitions with every `CONTROLLER_UPDATE`, and have
+peers adopt them via `ensure_topic()`. Widening is accepted (the controller
+correcting an under-informed guess); narrowing is refused, because losing
+partitions strands their data and remaps every key.
+
+**What it taught.** I had *documented* this gap in the split-brain script
+("ours does not replicate topic metadata") and treated it as acceptable. It was
+not — it made failover silently lose partitions. **Writing a limitation down is
+not the same as evaluating it.**
+
+And it was only found by running the thing by hand, exactly like #8. All 234
+tests passed throughout, because every test creates its topic on the broker it
+then talks to.
+
+---
+
+## 24. A quorum of two healthy brokers could not elect a leader
+
+**Phase 5 · [broker/raft/node.py](../broker/raft/node.py)**
+
+**What happened.** `chaos/kill_controller.py` killed the controller of a
+three-broker cluster. The two survivors — a clear majority of three — never
+elected a replacement. Not slowly: *never*. Terms climbed one per second,
+forever, with no leader and no error:
+
+    Node 2 starting election for term 6 (needs 2 of 3 votes)
+    Node 3 starting election for term 6 (needs 2 of 3 votes)
+    Node 2 lost election for term 6: 1 of 2 votes
+    Node 3 lost election for term 6: 1 of 2 votes
+
+**Why.** `_begin_election` tallied votes with `asyncio.gather`, which finishes
+at the pace of the **slowest** peer — and a dead peer is the slowest possible
+peer, because it costs the full RPC timeout every time. So each candidate sat
+for two seconds inside `gather`, waiting on a corpse, while its own 1–2 s
+election timer expired underneath it. The other survivor then campaigned for a
+higher term, and when `gather` finally returned, the guard
+`self.current_term != term` discarded a vote that had been **granted**. Both
+nodes did this to each other, in lockstep, indefinitely.
+
+**The fix.** Count each vote as it arrives and promote on the majority
+immediately, rather than tallying at the end. The candidate stops caring about
+the dead peer entirely.
+
+**What it taught.** *"Concurrent" is not the same as "does not wait."* The RPCs
+were already issued in parallel; the bug was in waiting for all of them. Any
+code that awaits every peer runs at the speed of the worst one, so on a
+distributed system that phrasing — "wait for all" — deserves suspicion wherever
+it appears.
+
+---
+
+## 25. The same bug, twice more, and why every test still passed
+
+**Phase 5 · [broker/raft/node.py](../broker/raft/node.py),
+[broker/broker.py](../broker/broker.py)**
+
+**What happened.** With the vote count fixed, the survivors elected in
+milliseconds — and then flapped. Leadership alternated between them roughly
+once a second, terms climbing without end, on a cluster where nothing was
+wrong with either node.
+
+**Why.** "Wait for the slowest peer" was in three places, not one:
+
+| Where | What it cost |
+|---|---|
+| `_begin_election` tallying votes | a granted vote discarded as stale (#24) |
+| `_run` **awaiting** the election | a node won in ~5 ms, then sent nothing for 2 s |
+| `_heartbeat_tick` via `_replicate_to_all` | a 150 ms heartbeat became a 2 s one |
+| `Broker._heartbeat_peers` | membership flapped against a 700 ms session timeout |
+
+Each is the same mistake in a different costume, and they compound: a 2 s
+heartbeat against a 1–2 s election timeout means healthy followers depose a
+healthy leader on schedule. Raft stayed **safe** throughout — never two
+leaders — but nothing ever committed, because each new leader was deposed
+before it finished anything.
+
+The membership flap made it worse in a way worth noticing: liveness changes
+drive placement, so the controller re-proposed the partition map on every
+flap, and each proposal spent its own two seconds waiting on the same corpse.
+One dead broker out of three kept the survivors permanently busy
+rediscovering each other.
+
+**The fix.** Timers fire work off and return. `_heartbeat_tick` spawns
+per-peer replication instead of gathering it; `_begin_election` spawns its
+canvass; `_heartbeat_peers` spawns per-peer heartbeats. Each keeps an
+`_inflight` set so a slow peer is skipped rather than queued behind itself.
+`_replicate_to_all` still awaits — that is correct for `propose`, which needs
+the outcome.
+
+**What it taught.** *A cadence must be a property of the thing keeping time,
+never of the thing it is waiting for.* That is the single sentence version of
+all four bugs.
+
+And the reason none of this was caught: **the test transport had no dead
+peers.** A blocked message returned `None` instantly, so waiting for every
+peer cost nothing and the implementation looked correct in all 24 Raft tests.
+A real dead broker is not silent, it is *slow*. Modelling failure as silence
+tested a network that does not exist.
+
+The fix there is a `down_delay` in the test network and one test that asserts
+the survivors elect **and are still leading 1.5 s later** — because electing
+once was never the hard part. It fails against every version of the code that
+shipped before it.
+
+---
+
+## 26. A one-voter quorum could no longer elect itself
+
+**Phase 5 · [broker/raft/node.py](../broker/raft/node.py)**
+
+**What happened.** The fix for #24 broke 42 tests at once. A single broker
+never became a controller, so every request was answered
+`NOT_LEADER_OR_FOLLOWER`.
+
+**Why.** Promotion had moved into the RequestVote *response* handler. A lone
+voter has no peers, so it sends no requests, so it receives no responses, so
+nothing ever checked that its own vote was already a majority.
+
+**The fix.** Check the threshold once after casting the self-vote, before
+canvassing.
+
+**What it taught.** Incremental algorithms need their base case checked
+explicitly: "on each arrival, test the total" silently skips the case where
+nothing arrives. This one was caught instantly and loudly, which is the whole
+difference between it and #24 — and the reason it is a footnote rather than a
+day. Worth noting that quorums of one are not a toy: they are what a
+development cluster and most of this test suite actually run.
+
+---
+
+## 27. A test that could not pass, and the boundary it found
+
+**Phase 5 · [tests/test_raft_snapshot.py](../tests/test_raft_snapshot.py)**
+
+**What happened.** Writing the tests for log compaction, one refused to pass:
+a follower was partitioned, the leader compacted and moved on, the partition
+healed — and the follower never converged. Eleven of twelve tests passed; this
+one looped forever, printing `peer 2 needs a snapshot (wants index 1, log
+starts at 9)` several times a second.
+
+**Why.** The warning was correct and the test was wrong. Partitioning the
+follower *before* any replication left it needing index 1, which the leader had
+long since discarded. That is not the case Step A handles — it is precisely the
+case `InstallSnapshot` exists for, and `InstallSnapshot` had not been built yet.
+The test was asking Step A to do Step B's job.
+
+**The fix.** Rewrite the setup so the follower is behind the leader's *last*
+index but at or after its *snapshot* index: stay connected across two
+compactions, then miss fewer entries than the threshold. That is the genuine
+Step A case, and it passes.
+
+**What it taught.** Two things, and the second is the useful one.
+
+The narrow lesson: compaction introduces a failure mode that did not previously
+exist. Before it, "behind" was one state and always recoverable. After it,
+"behind" splits into *recoverable* and *unrecoverable*, and the line between
+them is `first_index`.
+
+The broader one: a test that cannot pass is worth more than a test that was
+never written, provided you work out *why* rather than adjusting it until it
+goes green. Loosening the assertion here would have produced a passing suite
+that quietly claimed a guarantee the code does not offer. The failing test was
+the thing that made the Step A / Step B boundary concrete enough to document.
+
+**A footnote of the same shape.** `docs/phase-5/raft-snapshots.md` originally
+claimed that deleting the log sentinel would break "only the follower catch-up
+case". Running it broke seven tests immediately — the sentinel also anchors the
+offset arithmetic. The *subtle* break turned out to be keeping the sentinel and
+zeroing its term, which fails three. The doc now says both, because an exercise
+whose stated outcome is wrong teaches the reader to distrust the exercises.
+
+---
+
+## 28. Two numbers stated from memory, one of them wrong by twenty times
+
+**Phase 5 · [docs/phase-5/raft-install-snapshot.md](phase-5/raft-install-snapshot.md)**
+
+**What happened.** The `InstallSnapshot` doc justified sending a snapshot in
+one message rather than chunking it, and put a number on where that breaks:
+"roughly ten thousand partitions." The number was invented — a plausible-
+sounding figure written to make the trade-off feel concrete.
+
+**Why it was wrong.** Measuring took four lines. A partition assignment
+serialises to about 54 bytes of JSON, and `MAX_REQUEST_BYTES` is 10 MB, so the
+real ceiling is near **190,000 partitions** — off by a factor of twenty, and
+wrong in the direction that makes the design look worse than it is.
+
+**The fix.** Build the snapshot at four sizes, measure each, and put the table
+in the doc.
+
+**What it taught.** The same lesson as Phase 1's pipelining prediction, which
+was also wrong by an order of magnitude: **a number in a document is a claim,
+and a claim nobody measured is decoration.** The tell is grammatical —
+"roughly", "on the order of", "should be around" are what invented numbers
+wear. This one mattered a little more than most, because the whole point of
+stating a limit is so a reader can decide whether it applies to them, and a
+reader with 20,000 partitions would have been told to chunk for no reason.
+
+---
+
 ## Cross-cutting lessons
 
 **Measure the claim, and keep the number that argues against you.** Phase 1's
@@ -606,3 +899,12 @@ been correct for three phases, the moment a second thread touched it.
 
 **An impossible result is a broken instrument.** #3 and #12 were both
 measurement bugs presenting as findings.
+
+**A bug found once is a bug worth searching for.** #24 was fixed, and the same
+mistake was still in three other places (#25). After understanding *why*
+something was wrong, grep for the shape of it before moving on.
+
+**Model failure the way it actually fails.** The Raft tests modelled a dead
+node as instant silence, which is cheap, obvious, and wrong: dead things are
+slow, not quiet. An entire class of timing bug was invisible for a whole phase
+because of that one simplification in a test helper.

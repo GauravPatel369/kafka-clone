@@ -186,7 +186,7 @@ def main() -> None:
 
         victim_runner.stop()
         victim._stop_heartbeat()
-        victim._conn.close()
+        victim._cluster.close()
         victim._heartbeat_conn.close()
 
         started = time.time()
@@ -213,7 +213,7 @@ def main() -> None:
   container, a laptop lid closing. It wakes up still believing it owns
   partitions and tries to commit.\n""")
 
-        victim._conn.connect()
+        victim._cluster.refresh()
         try:
             victim.position = {(TOPIC, p): 1 for p in victim_partitions}
             victim.committed = {}
