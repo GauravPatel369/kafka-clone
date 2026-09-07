@@ -200,6 +200,62 @@ class Log:
         self._maybe_fsync()
         return offset
 
+    def append_replicated(self, records: list) -> int:
+        """
+        Append records that already carry their offsets. Returns how many.
+
+        CONCEPT: a follower must NOT assign offsets — it must preserve them.
+
+          `append()` stamps `self.next_offset` onto each record, which is
+          exactly right for a leader: the leader is what decides that a message
+          is number 41. A follower doing the same would be *re-deciding* it,
+          and the moment its log and the leader's diverge by a single record —
+          a retry, a gap, a truncation — every offset after that point names a
+          different message on the two machines.
+
+          Every guarantee in the system rests on an offset naming exactly one
+          message everywhere. So replication copies the number rather than
+          recomputing it, and this method exists to make that difference
+          impossible to get wrong by accident.
+
+        Records at or before our end are skipped, not written. A follower
+        re-fetching after a restart legitimately receives records it already
+        has, and appending them again would duplicate offsets in its own log.
+
+        A record that would leave a GAP raises. The follower's fetch loop asks
+        from its own log end, so a gap means the leader answered a question
+        nobody asked — and a log with a hole in it silently breaks the index,
+        the high watermark, and every read that crosses it.
+        """
+        written = 0
+
+        for record in records:
+            offset = int(record['offset'])
+
+            if offset < self.next_offset:
+                continue                        # already have it
+            if offset > self.next_offset:
+                raise ValueError(
+                    f"replication gap: log ends at {self.next_offset}, "
+                    f"leader sent offset {offset}")
+
+            self._maybe_roll()
+            self.active_segment.append({
+                'offset': offset,
+                'key': record.get('key'),
+                'value': record.get('value'),
+                # The LEADER's timestamp, not ours. A follower stamping its own
+                # clock would make the same message carry different times on
+                # different machines, and retention would then delete it from
+                # one replica before another.
+                'timestamp': record.get('timestamp'),
+            })
+            written += 1
+
+        if written:
+            self._maybe_fsync()
+        return written
+
     def _maybe_roll(self) -> None:
         """
         Seal the active segment and start a new one if it is full or old.
@@ -240,16 +296,29 @@ class Log:
 
     # ── Reading ────────────────────────────────────────────────
 
-    def read(self, start_offset: int, max_messages: int = 10) -> list:
+    def read(self, start_offset: int, max_messages: int = 10,
+             limit_offset: int = None) -> list:
         """
         Return up to `max_messages` records with offset >= start_offset.
 
         Reads across a segment boundary when a batch spans one — a caller
         asking for 100 messages should get 100, not "however many happened to
         be left in that file".
+
+        `limit_offset` is an EXCLUSIVE upper bound (Phase 6's high watermark):
+        nothing at or after it is returned. Applied as a cap on how many
+        records to read rather than as a filter afterwards, so a consumer at
+        the watermark does the same small seek it always did instead of
+        reading a batch and discarding it.
         """
         if max_messages <= 0:
             return []
+
+        if limit_offset is not None:
+            readable = limit_offset - start_offset
+            if readable <= 0:
+                return []
+            max_messages = min(max_messages, readable)
 
         # Below the log start means retention has deleted that data. Return
         # nothing rather than the oldest surviving records.

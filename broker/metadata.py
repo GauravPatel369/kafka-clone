@@ -80,6 +80,13 @@ VALID_TOPIC_NAME = re.compile(r'^[a-zA-Z0-9._-]+$')
 MAX_TOPIC_NAME_LENGTH = 249
 MAX_PARTITIONS = 1024           # sanity bound; real clusters go higher
 
+# More copies than this is almost always a misunderstanding rather than a
+# durability requirement: the industry default is 3, and 5 is reserved for
+# metadata nobody can afford to lose. The real ceiling is the cluster size —
+# a replica set cannot name more brokers than exist — and that is enforced at
+# assignment time, where the live broker list is actually known.
+MAX_REPLICATION_FACTOR = 16
+
 
 class InvalidTopicError(Exception):
     """The topic name or configuration is not acceptable."""
@@ -90,10 +97,11 @@ class TopicConfig:
     """
     One topic's configuration.
 
-    `replication_factor` is stored but always 1 until Phase 6 — recorded now so
-    that adding replicas is a change to the broker, not a change to the
-    on-disk metadata format. Migrating a format is much more annoying than
-    carrying an unused field.
+    `replication_factor` was carried unused from Phase 3 to Phase 6 —
+    recorded early so that adding replicas would be a change to the broker,
+    not a change to the on-disk metadata format. That bet paid: Phase 6 opened
+    the gate in `create_topic` and every existing metadata file kept working.
+    Migrating a format is much more annoying than carrying an unused field.
     """
     partitions: int
     replication_factor: int = 1
@@ -220,9 +228,12 @@ class MetadataStore:
         if partitions > MAX_PARTITIONS:
             raise InvalidTopicError(
                 f"partitions must be <= {MAX_PARTITIONS}, got {partitions}")
-        if replication_factor != 1:
+        if replication_factor < 1:
             raise InvalidTopicError(
-                f"replication_factor must be 1 until Phase 6 adds replicas, "
+                f"replication_factor must be >= 1, got {replication_factor}")
+        if replication_factor > MAX_REPLICATION_FACTOR:
+            raise InvalidTopicError(
+                f"replication_factor must be <= {MAX_REPLICATION_FACTOR}, "
                 f"got {replication_factor}")
 
         config = TopicConfig(partitions=partitions,
@@ -276,13 +287,24 @@ class MetadataStore:
           under-informed guess. A NARROWING is refused — losing partitions
           would strand their data and remap every key, and no legitimate flow
           produces one.
+
+        The replication factor follows a different rule from the width: it is
+        adopted whenever it differs, in either direction. Width is a structural
+        property whose reduction destroys data; the factor is a policy that a
+        cluster is allowed to lower. Applying the width rule to both would make
+        `replication_factor` a ratchet nobody could ever turn back down.
         """
         existing = self.topics.get(name)
-        if existing is not None and existing.partitions >= partitions:
+        wider = existing is None or existing.partitions < partitions
+        refactored = (existing is not None
+                      and existing.replication_factor != replication_factor)
+
+        if not wider and not refactored:
             return False
 
-        self.topics[name] = TopicConfig(partitions=partitions,
-                                        replication_factor=replication_factor)
+        self.topics[name] = TopicConfig(
+            partitions=max(partitions, existing.partitions) if existing else partitions,
+            replication_factor=replication_factor)
         self._save()
         return True
 

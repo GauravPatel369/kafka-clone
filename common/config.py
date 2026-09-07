@@ -164,3 +164,28 @@ DEFAULT_BROKER_SESSION_TIMEOUT_MS = 3000
 # lower it to a handful so compaction actually happens under real elections
 # and real replication.
 DEFAULT_RAFT_SNAPSHOT_THRESHOLD = 1000
+
+# ── Replication (Phase 6) ──────────────────────────────────────
+
+# How long a replica may go without FETCHING before it is ejected from the
+# in-sync set.
+#
+# Time, not a record count. Kafka shipped `replica.lag.max.messages` and
+# removed it in 0.9: a count threshold cannot tell a broken replica from a
+# healthy one during a traffic spike, so a producer burst would eject the whole
+# ISR at exactly the moment durability matters most. "Is it still talking to
+# me?" survives a burst; "is it more than N behind?" does not.
+DEFAULT_REPLICA_LAG_TIME_MAX_MS = 3000
+
+# How many in-sync replicas an `acks=all` write requires.
+#
+# 1 keeps a single-broker cluster working unchanged, which every test from
+# Phase 0 onward depends on. The interesting production value is 2 alongside
+# RF=3: it tolerates one broker failing while still guaranteeing every
+# acknowledged write sits on two machines. Setting it equal to RF means ANY
+# single failure stops writes.
+DEFAULT_MIN_INSYNC_REPLICAS = 1
+
+# How long `acks=all` waits for the high watermark to reach the written offset
+# before giving up with REQUEST_TIMED_OUT.
+DEFAULT_ACKS_ALL_TIMEOUT_MS = 10_000

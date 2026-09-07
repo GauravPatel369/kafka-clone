@@ -79,6 +79,7 @@ UNKNOWN_MEMBER_ID = 25
 REBALANCE_IN_PROGRESS = 27
 UNSUPPORTED_VERSION = 35
 INVALID_REQUEST = 42
+FENCED_LEADER_EPOCH = 74
 
 
 ERROR_NAMES = {
@@ -97,6 +98,7 @@ ERROR_NAMES = {
     REBALANCE_IN_PROGRESS: 'REBALANCE_IN_PROGRESS',
     UNSUPPORTED_VERSION: 'UNSUPPORTED_VERSION',
     INVALID_REQUEST: 'INVALID_REQUEST',
+    FENCED_LEADER_EPOCH: 'FENCED_LEADER_EPOCH',
 }
 
 
@@ -199,6 +201,28 @@ class NotEnoughReplicasError(RetriableError):
 
     Kafka choosing consistency over availability, out loud. Phase 6."""
     error_code = NOT_ENOUGH_REPLICAS
+
+
+class FencedLeaderEpochError(RetriableError):
+    """
+    This broker's idea of who leads the partition is out of date.
+
+    Distinct from NOT_LEADER_OR_FOLLOWER, and the distinction is diagnostic
+    rather than cosmetic:
+
+        NOT_LEADER_OR_FOLLOWER   "I never led this" — routine, happens on
+                                 every placement change
+        FENCED_LEADER_EPOCH      "I thought I led this and I am the stale
+                                 one" — a broker was serving a partition it
+                                 had already lost
+
+    The second is the split-brain case on the DATA plane: a partitioned leader
+    that has not yet heard it was replaced, accepting writes into a log nobody
+    will read while telling producers they succeeded. Retriable for the client
+    (refresh metadata, find the real leader) and a thing an operator should be
+    able to grep for.
+    """
+    error_code = FENCED_LEADER_EPOCH
 
 
 class RebalanceInProgressError(RetriableError):
