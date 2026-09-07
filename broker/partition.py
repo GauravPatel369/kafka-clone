@@ -90,9 +90,23 @@ class Partition:
         with self._lock:
             return self.log.append(value, key)
 
+    def append_replicated(self, records: list) -> int:
+        """
+        Append records fetched from this partition's leader, offsets intact.
+
+        Takes the same lock as `append`, and that is not merely tidiness: a
+        broker can be a follower for a partition and, an instant later, its
+        leader. Two writers on one log is exactly what the lock exists for,
+        and the window where both paths are live is precisely a failover —
+        the moment least able to survive a duplicated offset.
+        """
+        with self._lock:
+            return self.log.append_replicated(records)
+
     # ── Read ───────────────────────────────────────────────────
 
-    def fetch(self, start_offset: int, max_messages: int = 10) -> list:
+    def fetch(self, start_offset: int, max_messages: int = 10,
+              limit_offset: int = None) -> list:
         """
         Return up to `max_messages` records with offset >= start_offset.
 
@@ -101,8 +115,14 @@ class Partition:
         the same whether the partition holds a thousand records or a billion.
         That change is the entire point of Phase 2, and the benchmark's seek
         profile is where you can see it.
+
+        `limit_offset` (Phase 6) is the high watermark: records at or after it
+        exist locally but are not yet on every replica, so a consumer must not
+        see them. A follower passes None — it is the one reader that must be
+        able to read past the watermark, because its doing so is what advances
+        it.
         """
-        return self.log.read(start_offset, max_messages)
+        return self.log.read(start_offset, max_messages, limit_offset)
 
     # ── State ──────────────────────────────────────────────────
 
