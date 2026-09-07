@@ -74,6 +74,7 @@ import threading
 
 from broker.cluster import ClusterState
 from broker.controller import Controller
+from broker.replica import ReplicaFetcher
 from broker.coordinator import GroupCoordinator
 from broker.raft import RaftNode
 from broker.log import LogConfig
@@ -84,7 +85,9 @@ from broker.partition import Partition
 from common import errors
 from common.cluster_config import ClusterConfig, ClusterConfigError
 from common.config import (
-    DEFAULT_BROKER_HEARTBEAT_MS, DEFAULT_BROKER_SESSION_TIMEOUT_MS,
+    DEFAULT_ACKS_ALL_TIMEOUT_MS, DEFAULT_BROKER_HEARTBEAT_MS,
+    DEFAULT_BROKER_SESSION_TIMEOUT_MS, DEFAULT_MIN_INSYNC_REPLICAS,
+    DEFAULT_REPLICA_LAG_TIME_MAX_MS,
     DEFAULT_DATA_DIR, DEFAULT_GROUP_REAP_MS, DEFAULT_HOST, DEFAULT_PORT,
     DEFAULT_RETENTION_CHECK_MS,
 )
@@ -115,7 +118,10 @@ class Broker:
                  broker_heartbeat_ms: float = DEFAULT_BROKER_HEARTBEAT_MS,
                  broker_session_timeout_ms: float = DEFAULT_BROKER_SESSION_TIMEOUT_MS,
                  quorum_voters: list = None,
-                 raft_snapshot_threshold: int = None):
+                 raft_snapshot_threshold: int = None,
+                 replica_lag_time_max_ms: float = DEFAULT_REPLICA_LAG_TIME_MAX_MS,
+                 min_insync_replicas: int = DEFAULT_MIN_INSYNC_REPLICAS,
+                 acks_all_timeout_ms: float = DEFAULT_ACKS_ALL_TIMEOUT_MS):
         self.host = host
         self.port = port          # rewritten with the real port if port == 0
         self.data_dir = data_dir
@@ -156,7 +162,13 @@ class Broker:
             node_id, host, port)
         self.cluster = ClusterState(node_id, self.cluster_config,
                                     broker_session_timeout_ms)
-        self.controller = Controller(self.cluster, self.metadata)
+        self.replica_lag_time_max_ms = replica_lag_time_max_ms
+        self.min_insync_replicas = min_insync_replicas
+        self.acks_all_timeout_ms = acks_all_timeout_ms
+
+        self.controller = Controller(
+            self.cluster, self.metadata,
+            replica_lag_time_max_ms=replica_lag_time_max_ms)
         self.broker_heartbeat_ms = broker_heartbeat_ms
 
         # The controller quorum. Leadership comes from here now, not from
@@ -198,6 +210,10 @@ class Broker:
         )
         # Constructed after the RaftNode, so the controller can propose to it.
         self.controller.raft = self.raft
+
+        # Follower copies. One fetch loop per partition this broker should
+        # hold but does not lead — see broker/replica.py.
+        self.replicas = ReplicaFetcher(self)
 
         # Strong references to fire-and-forget tasks. asyncio only keeps a weak
         # reference, so a task nobody holds can be collected mid-flight.
@@ -415,8 +431,16 @@ class Broker:
         except InvalidTopicError as exc:
             return _error(errors.INVALID_REQUEST, str(exc))
 
+        # The replication factor is committed WITH the topic, not applied
+        # locally afterwards. It is an input to placement, and placement runs
+        # on whichever broker is controller — which may not be this one by the
+        # time the next tick fires. A factor that lived only in the local
+        # store would be invisible to the node that actually needs it, and the
+        # partition would be silently created with one copy.
         committed = await self.raft.propose({
-            'type': 'CREATE_TOPIC', 'name': name, 'partitions': int(partitions)})
+            'type': 'CREATE_TOPIC', 'name': name,
+            'partitions': int(partitions),
+            'replication_factor': int(replication_factor)})
         if not committed:
             return _error(errors.LEADER_NOT_AVAILABLE,
                           "could not commit the topic to the quorum")
@@ -433,6 +457,91 @@ class Broker:
             'partitions': config.partitions,
             'replication_factor': config.replication_factor,
         }
+
+    def _enough_replicas(self, topic: str, part_id: int):
+        """
+        Refuse an `acks=all` write when the ISR is too small. None if fine.
+
+        CONCEPT: this is the CAP choice, made out loud.
+
+          The broker is healthy, the disk is fine, the producer is connected —
+          and the write is refused, because accepting it would mean
+          acknowledging data that one machine failure could erase. A system
+          that chooses consistency has to be willing to say no while looking
+          perfectly well.
+
+        Checked BEFORE the append, deliberately. Writing first and failing the
+        acknowledgement afterwards would leave the record in the leader's log,
+        where a later ISR recovery would replicate it — so a producer told
+        FAILED would find its message in the topic anyway. Refusing up front
+        is what makes the error mean what it says.
+
+        It counts the ISR, not the replica set: three replicas of which one is
+        dead is two in-sync, and pretending otherwise is exactly the lie this
+        check exists to prevent.
+
+        CONCEPT: committed ISR and OBSERVED ISR answer different questions, and
+        this one needs both.
+
+          The committed set (agreed through Raft) is what leader election must
+          read — it has to outlive the leader that computed it. But a leader
+          cut off from the quorum cannot commit anything, including the news
+          that its followers have stopped fetching. Trusting the committed set
+          alone, it would keep acknowledging `acks=all` writes claiming three
+          copies while holding the only one.
+
+          That was a real bug, found by isolating a leader that was also the
+          controller: `ISR [1, 2, 3]` with `observed [1]`, and every write
+          accepted.
+
+          So acceptance uses the INTERSECTION. It can only ever be smaller than
+          the committed set, which is the safe direction: a leader may refuse a
+          write it could have taken, and may never take one it should refuse.
+        """
+        committed = self.cluster.isr_for(topic, part_id)
+        observed = self.cluster.in_sync_replicas(
+            topic, part_id, self.replica_lag_time_max_ms)
+        in_sync = [n for n in committed if n in observed]
+
+        if len(in_sync) >= self.min_insync_replicas:
+            return None
+
+        return _error(
+            errors.NOT_ENOUGH_REPLICAS,
+            f"{topic}-{part_id} has {len(in_sync)} in-sync replica(s) "
+            f"{in_sync}, needs {self.min_insync_replicas}")
+
+    async def _await_replication(self, topic: str, part_id: int,
+                                 offset: int) -> bool:
+        """
+        Block until every in-sync replica holds `offset`. False on timeout.
+
+        CONCEPT: `acks=all` does not count acknowledgements.
+
+          The high watermark ALREADY means "every in-sync replica has this".
+          So waiting for `hw > offset` is the whole implementation — no
+          per-follower bookkeeping, no acknowledgement protocol, no second
+          mechanism to keep consistent with the first. Step 3 built this; Step
+          5 just consults it.
+
+        Polling rather than an event, because the watermark advances inside
+        another request's handler (a follower's FETCH) and a condition variable
+        shared between them would buy microseconds at the cost of a lock this
+        broker does not otherwise need.
+        """
+        partition = self._get_partition(topic, part_id)
+        deadline = (asyncio.get_running_loop().time()
+                    + self.acks_all_timeout_ms / 1000.0)
+
+        while asyncio.get_running_loop().time() < deadline:
+            watermark = self.cluster.high_watermark(
+                topic, part_id, partition.next_offset,
+                self.replica_lag_time_max_ms)
+            if watermark > offset:
+                return True
+            await asyncio.sleep(0.002)
+
+        return False
 
     async def _handle_produce_v1(self, payload: dict) -> dict:
         """
@@ -488,8 +597,10 @@ class Broker:
 
             # Leadership is checked per partition too, for the same reason the
             # error codes are: one request may span several partitions, and
-            # some may have moved while others did not.
-            wrong_leader = self._not_leader(topic, part_id)
+            # some may have moved while others did not. The epoch is
+            # per-partition for exactly the same reason.
+            wrong_leader = self._not_leader(
+                topic, part_id, entry.get('leader_epoch'))
             if wrong_leader is not None:
                 results.append(dict(wrong_leader, partition=part_id,
                                     base_offset=-1, count=0))
@@ -500,9 +611,35 @@ class Broker:
                                 'base_offset': -1, 'count': 0})
                 continue
 
+            if acks == 'all':
+                short = self._enough_replicas(topic, part_id)
+                if short is not None:
+                    results.append(dict(short, partition=part_id,
+                                        base_offset=-1, count=0))
+                    continue
+
             partition = self._get_partition(topic, part_id)
             base_offset = await self._run_blocking(
                 _append_records, partition, records)
+
+            if acks == 'all':
+                last = base_offset + len(records) - 1
+                if not await self._await_replication(topic, part_id, last):
+                    # The records ARE in the leader's log and will replicate
+                    # once the followers recover. Saying so honestly beats
+                    # claiming either success or a clean failure: the producer
+                    # should retry, and a retry may duplicate — which is what
+                    # at-least-once means and why Kafka has an idempotent
+                    # producer that we do not.
+                    results.append({
+                        'partition': part_id,
+                        'error_code': errors.REQUEST_TIMED_OUT,
+                        'error_message': (
+                            f"wrote {topic}-{part_id} at {base_offset} but it "
+                            f"did not reach every in-sync replica in time"),
+                        'base_offset': base_offset, 'count': len(records)})
+                    total += len(records)
+                    continue
 
             results.append({'partition': part_id, 'error_code': errors.NONE,
                             'base_offset': base_offset, 'count': len(records)})
@@ -536,12 +673,26 @@ class Broker:
             return _error(exc.error_code, str(exc))
         await self._refresh_placement()
 
-        wrong_leader = self._not_leader(topic, part_id)
+        wrong_leader = self._not_leader(
+            topic, part_id, payload.get('leader_epoch'))
         if wrong_leader is not None:
             return wrong_leader
 
+        acks = payload.get('acks', 1)
+        if acks == 'all':
+            short = self._enough_replicas(topic, part_id)
+            if short is not None:
+                return short
+
         partition = self._get_partition(topic, part_id)
         offset = await self._run_blocking(partition.append, value, key)
+
+        if acks == 'all' and not await self._await_replication(
+                topic, part_id, offset):
+            return _error(
+                errors.REQUEST_TIMED_OUT,
+                f"wrote {topic}-{part_id} at {offset} but it did not reach "
+                f"every in-sync replica in time")
 
         log.info("PRODUCE -> %s-%s offset=%s value=%r", topic, part_id, offset, value)
 
@@ -570,7 +721,8 @@ class Broker:
             return _error(exc.error_code, str(exc))
         await self._refresh_placement()
 
-        wrong_leader = self._not_leader(topic, part_id)
+        wrong_leader = self._not_leader(
+            topic, part_id, payload.get('leader_epoch'))
         if wrong_leader is not None:
             return wrong_leader
 
@@ -586,24 +738,83 @@ class Broker:
                 f"offset {start_offset} is below the log start "
                 f"{partition.log_start_offset}; that data has been deleted")
 
-        messages = await self._run_blocking(partition.fetch, start_offset, max_msgs)
+        # `replica_id` marks a FOLLOWER's fetch rather than a consumer's, and
+        # it changes two things.
+        replica_id = payload.get('replica_id')
 
-        log.info("FETCH  ← %s-%s from=%s returned=%s",
-                 topic, part_id, start_offset, len(messages))
+        if replica_id is not None:
+            # A follower asking for offset N has, by asking, proved it holds
+            # everything below N. The request IS the progress report.
+            self.cluster.record_replica_position(
+                topic, part_id, int(replica_id), start_offset)
 
-        # `high_watermark` is one past the last message. A consumer subtracts
-        # its position from it to get LAG — the most-watched number in any
-        # Kafka deployment, because unbounded lag means retention will delete
-        # data nobody has read. In Phase 6 this stops meaning "everything
-        # written" and starts meaning "everything REPLICATED", which is a much
-        # more interesting number.
+        watermark = self.cluster.high_watermark(
+            topic, part_id, partition.next_offset,
+            self.replica_lag_time_max_ms)
+
+        # CONCEPT: consumers are clamped to the high watermark; followers are
+        # not. The asymmetry is the whole idea, and it is circular in a way
+        # that takes a moment to see.
+        #
+        #   The act of a follower READING a record is what makes that record
+        #   safe for consumers. Clamp the follower too and nothing is ever
+        #   replicated past the watermark, so the watermark never advances, so
+        #   nothing is ever readable. The cluster would sit at offset 0 looking
+        #   perfectly healthy.
+        #
+        # And why clamp consumers at all: a consumer that reads offset 9 from a
+        # leader that then dies has acted on a record no survivor holds. The
+        # new leader's log ends at 8, and its next write becomes offset 9 — a
+        # DIFFERENT message wearing an offset somebody already processed. That
+        # is worse than losing the record; it breaks the one-offset-one-message
+        # guarantee everything else is built on.
+        limit = None if replica_id is not None else watermark
+        messages = await self._run_blocking(
+            partition.fetch, start_offset, max_msgs, limit)
+
+        # CONCEPT: long-polling. An empty answer is held, not sent.
+        #
+        # Without this, a caught-up follower sleeps between fetches and only
+        # discovers a new record when it next wakes — so `acks=all` waits for
+        # the follower's POLL INTERVAL rather than for the network. Measured:
+        # 200 ms per message, an `acks=all` cost of 358x rather than the ~2x
+        # the round trip actually justifies. The producer was paying for the
+        # follower's sleep schedule.
+        #
+        # Polling harder would trade that for constant idle chatter. Holding
+        # the request instead costs nothing while idle and returns the instant
+        # data lands, which is why Kafka has `fetch.max.wait.ms` and why a
+        # replica fetch sets it.
+        max_wait_ms = float(payload.get('max_wait_ms') or 0)
+        if not messages and max_wait_ms > 0:
+            deadline = asyncio.get_running_loop().time() + max_wait_ms / 1000.0
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.002)
+
+                watermark = self.cluster.high_watermark(
+                    topic, part_id, partition.next_offset,
+                    self.replica_lag_time_max_ms)
+                limit = None if replica_id is not None else watermark
+                messages = await self._run_blocking(
+                    partition.fetch, start_offset, max_msgs, limit)
+                if messages:
+                    break
+
+        log.info("FETCH  ← %s-%s from=%s returned=%s hw=%s%s",
+                 topic, part_id, start_offset, len(messages), watermark,
+                 f" (replica {replica_id})" if replica_id is not None else '')
+
+        # `high_watermark` no longer means "everything written". It now means
+        # "everything REPLICATED" — which is what makes consumer lag a measure
+        # of durable backlog rather than of disk backlog.
         return {
             'error_code': errors.NONE,
             'topic': topic,
             'partition': part_id,
             'messages': messages,
             'count': len(messages),
-            'high_watermark': partition.next_offset,
+            'high_watermark': watermark,
+            'log_end_offset': partition.next_offset,
             'log_start_offset': partition.log_start_offset,
         }
 
@@ -733,20 +944,21 @@ class Broker:
                 leader_id = self.cluster.leader_for(name, part_id)
                 partition_entries.append({
                     'partition': part_id,
-                    # With one broker, every partition is led by us and has
-                    # exactly one replica, which is trivially in-sync. Phase 5
-                    # assigns real leaders; Phase 6 real replicas and a real
-                    # ISR. The SHAPE is right now, so clients written against
-                    # it keep working.
                     # The real leader, from the controller's map. -1 when
                     # unassigned, so a client can tell "not placed yet" from
                     # "placed on broker 0" — the same -1-vs-0 distinction that
                     # committed offsets needed in Phase 4.
                     'leader': leader_id if leader_id is not None else -1,
-                    # Still ONE copy per partition: Phase 5 spreads partitions
-                    # across brokers, it does not replicate them. Phase 6 does.
-                    'replicas': [leader_id] if leader_id is not None else [],
-                    'isr': [leader_id] if leader_id is not None else [],
+                    # Real replica sets and a real ISR since Phase 6. With one
+                    # broker these collapse to a single trivially-in-sync copy,
+                    # which is why the SHAPE was right from Phase 3 and clients
+                    # written against it never had to change.
+                    'replicas': self.cluster.replicas_for(name, part_id),
+                    'isr': self.cluster.isr_for(name, part_id),
+                    # Handed out so a client can send it BACK on produce and
+                    # fetch. That round trip is what lets a broker recognise a
+                    # request aimed at a leadership it no longer holds.
+                    'leader_epoch': self.cluster.leader_epoch(name, part_id),
                     # A declared-but-never-written partition has no log yet.
                     # It is still a real partition — reporting 0/0 is honest,
                     # and omitting it would under-report the topic's width.
@@ -1051,7 +1263,9 @@ class Broker:
         """
         for name, partitions in self.raft.machine.topics.items():
             try:
-                self.metadata.ensure_topic(name, int(partitions))
+                self.metadata.ensure_topic(
+                    name, int(partitions),
+                    self.raft.machine.replication_factor(name))
             except InvalidTopicError:
                 pass
 
@@ -1167,9 +1381,9 @@ class Broker:
 
     # ── Cluster handlers ───────────────────────────────────────
 
-    def _not_leader(self, topic: str, partition: int):
+    def _not_leader(self, topic: str, partition: int, epoch: int = None):
         """
-        Return an error body if this broker does not lead the partition.
+        Return an error body if this broker may not serve the partition.
 
         CONCEPT: refusing is the whole point.
           Without this check a broker asked for a partition it does not lead
@@ -1184,15 +1398,66 @@ class Broker:
         An UNASSIGNED partition also fails here. A partition the controller has
         not placed yet is not ours to serve, and the client should come back
         once placement has happened.
+
+        CONCEPT: two failures, two error codes (Phase 6 step 6).
+
+          `NOT_LEADER_OR_FOLLOWER` means "I never led this" — routine, and
+          happens on every placement change. `FENCED_LEADER_EPOCH` means "I
+          thought I led this and I am the stale one", which is the split-brain
+          case on the DATA plane: a partitioned broker still accepting writes
+          into a log nobody will read, telling producers they succeeded.
+
+          Both are retriable and the client handles them identically. The
+          distinction is for the operator: the first is noise, the second is a
+          broker that was serving a partition it had already lost.
+
+        `epoch` is what the CALLER believes. A client that has never heard of
+        epochs passes None and is not fenced — it will be routed correctly by
+        the leadership check anyway, and rejecting it would break every
+        pre-Phase-6 client for no safety gain.
         """
-        if self.cluster.leads(topic, partition):
-            return None
-        leader = self.cluster.leader_for(topic, partition)
-        return _error(
-            errors.NOT_LEADER_OR_FOLLOWER,
-            f"broker {self.node_id} does not lead {topic}-{partition}"
-            + (f"; broker {leader} does" if leader is not None
-               else "; it has not been assigned yet"))
+        if not self.cluster.leads(topic, partition):
+            leader = self.cluster.leader_for(topic, partition)
+            return _error(
+                errors.NOT_LEADER_OR_FOLLOWER,
+                f"broker {self.node_id} does not lead {topic}-{partition}"
+                + (f"; broker {leader} does" if leader is not None
+                   else "; it has not been assigned yet"))
+
+        if epoch is not None:
+            mine = self.cluster.leader_epoch(topic, partition)
+            theirs = int(epoch)
+
+            # THE DANGEROUS DIRECTION: the caller knows a NEWER epoch than we
+            # do. We still believe we lead this partition, and the only way
+            # the caller could have a higher number is that leadership moved
+            # and we have not heard.
+            #
+            # This is the split-brain case on the data plane, and it is the
+            # one the whole mechanism exists for. Getting the comparison
+            # backwards — refusing the stale CLIENT instead of the stale
+            # BROKER — passes every test and fences nothing: verified by
+            # producing to an isolated leader with a newer epoch and watching
+            # it succeed.
+            if theirs > mine:
+                return _error(
+                    errors.FENCED_LEADER_EPOCH,
+                    f"broker {self.node_id} believes it leads "
+                    f"{topic}-{partition} at epoch {mine}, but the caller "
+                    f"knows epoch {theirs}; this broker is stale")
+
+            # The other direction: the caller's metadata is older than ours.
+            # Harmless on its own — we DO lead the partition, which is what
+            # the caller wanted — but worth refusing so the caller refreshes
+            # rather than continuing to route on a stale map that may be wrong
+            # about other partitions too.
+            if theirs < mine:
+                return _error(
+                    errors.FENCED_LEADER_EPOCH,
+                    f"{topic}-{partition} is at leader epoch {mine}, "
+                    f"request carried {theirs}")
+
+        return None
 
     async def _handle_broker_heartbeat(self, payload: dict) -> dict:
         """
@@ -1207,6 +1472,14 @@ class Broker:
             return _error(errors.INVALID_REQUEST, "'node_id' is required")
 
         self.cluster.mark_alive(int(peer_id))
+
+        # Phase 6: the sender may have told us who is keeping up with the
+        # partitions IT leads. Only a leader can see that, so this is the only
+        # way a controller learns the ISR of a partition it does not serve.
+        report = payload.get('isr_report')
+        if report:
+            self.cluster.record_reported_isr(int(peer_id), report)
+
         return {'error_code': errors.NONE, 'node_id': self.node_id,
                 'controller_id': self.cluster.controller_id,
                 'metadata_version': self.cluster.metadata_version}
@@ -1436,6 +1709,9 @@ class Broker:
             self.cluster.set_controller(self.raft.leader_id)
             await self.controller.recompute()
 
+        self.replicas.start()
+        self.replicas.reconcile()
+
         cleaner = asyncio.create_task(self._retention_loop())
         reaper = asyncio.create_task(self._group_reap_loop())
         membership = asyncio.create_task(self._membership_loop())
@@ -1446,6 +1722,7 @@ class Broker:
         cleaner.cancel()
         reaper.cancel()
         membership.cancel()
+        await self.replicas.stop()
         await self.raft.stop()
         self.offsets.close()
         self._close_partitions()
@@ -1490,6 +1767,12 @@ class Broker:
 
                 if self.cluster.is_controller and await self.controller.recompute():
                     await self._push_controller_update()
+
+                # Start and stop follower loops to match the placement we now
+                # hold. Runs every tick, not only on change: it is cheap and
+                # idempotent, and "the placement changed" is exactly the event
+                # most likely to be missed.
+                self.replicas.reconcile()
 
             except asyncio.CancelledError:
                 return
@@ -1546,6 +1829,25 @@ class Broker:
         finally:
             self._heartbeats_inflight.discard(peer.node_id)
 
+    def _isr_report(self) -> list:
+        """
+        Who is keeping up, for every partition THIS broker leads.
+
+        Only the partitions we lead: an ISR is an observation of our own
+        followers' fetches, and we have no standing to describe a partition we
+        do not serve. The receiver enforces the same rule, because a report is
+        only as trustworthy as the check on it.
+        """
+        report = []
+        for topic, partition in self.cluster.my_partitions():
+            report.append({
+                'topic': topic,
+                'partition': partition,
+                'isr': self.cluster.in_sync_replicas(
+                    topic, partition, self.replica_lag_time_max_ms),
+            })
+        return report
+
     async def _heartbeat_one(self, peer) -> bool:
         """One heartbeat. Returns True if the peer answered."""
         if getattr(self, 'partitioned_from', None) and \
@@ -1568,7 +1870,14 @@ class Broker:
             writer.write(encode_message(
                 API_BROKER_HEARTBEAT,
                 {'node_id': self.node_id,
-                 'controller_id': self.cluster.controller_id},
+                 'controller_id': self.cluster.controller_id,
+                 # Piggy-backed on a message that was already being sent at
+                 # exactly the right cadence. A separate ISR-report API would
+                 # be a second timer to tune and a second thing to go quiet
+                 # independently of liveness — and "this broker is alive" and
+                 # "here is what its followers are doing" are answers to
+                 # nearly the same question.
+                 'isr_report': self._isr_report()},
                 correlation_id=1))
             await writer.drain()
 
