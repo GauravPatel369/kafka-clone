@@ -9,8 +9,11 @@ The phase docs explain *why* each mechanism exists. The
 **This is the reference**: open it next to the code when you need to know what
 actually happens.
 
-Line numbers are accurate as of the end of Phase 4. Function names are stable;
-if a line has drifted, search the name.
+Flows 1–18 are what a single broker does; flows 19–26 are what happens once
+there are several, and are where the interesting failures live.
+
+Line numbers were accurate when written and drift as the code changes. Function
+names are stable — if a line has moved, search the name.
 
 ---
 
@@ -36,6 +39,19 @@ if a line has drifted, search the name.
 | 16 | [Retention](#16-retention-deleting-old-data) | the cleaner task |
 | 17 | [Crash recovery](#17-crash-recovery) | `Log._load()` |
 | 18 | [Error handling](#18-how-an-error-travels) | anywhere |
+
+**Cluster flows (Phases 5 and 6):**
+
+| # | Flow | Starts at |
+|---|---|---|
+| 19 | [Cluster startup and membership](#19-cluster-startup-and-membership) | `--cluster cluster.json` |
+| 20 | [Electing a controller (Raft)](#20-electing-a-controller-raft) | an election timeout |
+| 21 | [Committing a metadata decision](#21-committing-a-metadata-decision) | `raft.propose()` |
+| 22 | [Placing partitions](#22-placing-partitions) | `controller.recompute()` |
+| 23 | [Snapshotting the Raft log](#23-snapshotting-the-raft-log) | `_maybe_snapshot()` |
+| 24 | [Catching up a lost follower](#24-catching-up-a-follower-that-fell-off-the-log) | `INSTALL_SNAPSHOT` |
+| 25 | [Routing a client](#25-routing-a-client-to-the-right-broker) | the metadata cache |
+| 26 | [Failing over a partition leader](#26-failing-over-a-partition-leader) | a broker dies |
 
 ---
 
@@ -92,6 +108,20 @@ Three details that each fix a real problem:
   ([broker.py:1050](../broker/broker.py#L1050)) uses `call_soon_threadsafe`,
   the only sanctioned way to touch a loop from outside its thread.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Broker startup enforces strict initialization order: storage configuration first, then metadata, group coordinator, and offset store. The broker runs on an asyncio TCP server with background coroutines for retention and dead consumer reaping. Using `port=0` gives ephemeral port binding for test isolation, and graceful shutdown cleanly drains connections and closes file handles."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When `python -m broker.broker` starts up, execution divides into two phases: synchronous component wiring in `__init__` and asynchronous lifecycle management in `start()`.*
+  >
+  > *First, in `__init__`, component construction order is strictly coupled: `log_config` is instantiated first because the storage engine tuning parameters are needed by subsequent components. Next, `MetadataStore` loads known topic definitions from disk. Then `GroupCoordinator` initializes consumer group state machines in memory. Finally, `OffsetStore` is constructed to manage `__consumer_offsets`, which requires `log_config` to be already initialized. If this order is violated, initialization crashes.*
+  >
+  > *Second, in `start()`, we invoke `asyncio.start_server()` to bind our TCP listener. In tests, we pass `port=0`, which instructs the OS kernel to bind any free ephemeral port, preventing port collisions across concurrent test runs; we immediately read `getsockname()[1]` back to discover the port. We then set a `threading.Event` (`self.ready`) so outer test threads know the broker is accepting sockets without relying on flaky `time.sleep()`.*
+  >
+  > *Concurrently, the broker launches two background asyncio tasks: `_retention_loop`, which periodically scans and deletes expired log segments, and `_group_reap_loop`, which monitors consumer group member heartbeat timestamps. The server loop waits on `_shutdown.wait()` rather than blocking with `serve_forever()`. When shutdown is requested, `stop()` schedules an event via `call_soon_threadsafe`, stopping new inbound connections, cancelling background cleaner tasks, and cleanly closing all open segment file descriptors across all partitions to prevent file descriptor leaks or unflushed buffers."*
+- **Key mechanism to highlight**: Constructor dependency ordering — `OffsetStore` depends on `log_config` already existing; asynchronous server loop with background tasks rather than thread-per-connection.
+- **Trap / Follow-up**: *"Why use an asyncio event loop if file I/O blocks?"* → The event loop multiplexes network I/O across thousands of idle connections. Whenever blocking disk I/O is needed (like appending to a partition log), it hops to a thread pool via `run_in_executor`.
+
 ---
 
 ## 2. Create a topic
@@ -140,6 +170,22 @@ truncates it to zero bytes first; a crash in that window leaves an **empty
 metadata file**, which reads back as "no topics exist" while every partition's
 data sits on disk unreachable. The `fsync` must precede the rename or the
 rename can land first and leave a correctly-named file full of zeros.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Topic creation declares partition counts upfront before any messages arrive. We write topic configurations atomically using a write-flush-fsync-rename pattern to prevent corrupted 0-byte files on crash. Crucially, topic creation creates zero log directories on disk — partition folders appear lazily on the first write."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When an administrator runs `kfk topics create --topic orders --partitions 4`, a `CREATE_TOPICS` RPC (API key 19) is dispatched to the broker.
+  >
+  > On the broker, `_handle_create_topics` validates the topic name against strict regex criteria (rejecting special characters and internal prefixes like `__consumer_offsets`). It then delegates to `MetadataStore.create_topic`.
+  >
+  > Here is the critical design choice: `create_topic` stores the schema in memory (`TopicConfig(partitions=4, replication_factor=1)`) and writes it to disk, but it creates ZERO partition directories or `.log` files on the filesystem. Partitions are instantiated lazily only when the first produce request arrives.
+  >
+  > Why must partition count be declared in advance if directories are lazy? Because producers route records by computing `murmur2(key) % num_partitions`. The producer needs an authoritative partition count *before* writing any records. If partition counts were derived by counting directories, the topic would report 0 or 1 partition initially, routing all initial keys to partition 0 until other directories were created, permanently scrambling key ordering.
+  >
+  > To persist metadata safely, `_save` executes a write-flush-fsync-rename sequence: we write JSON to a temporary file (`metadata.json.tmp`), flush Python's buffers, invoke `os.fsync(fd)` to force disk write, and finally execute an atomic filesystem rename via `os.replace`. If power is lost at any microsecond during this process, the file on disk is guaranteed to be either the complete prior metadata or the complete new metadata — never an empty or half-written file that would render all partition logs on disk unreadable."*
+- **Key mechanism to highlight**: Partitions must be declared in advance because producers hash `murmur2(key) % num_partitions`. If directories were created lazily without a central declaration, partition count would fluctuate as data arrived, breaking key ordering.
+- **Trap / Follow-up**: *"What happens if power is cut during topic creation?"* → Atomic rename (`os.replace`) ensures the filesystem exposes either the complete previous metadata file or the complete new metadata, never a truncated or empty file.
 
 ---
 
@@ -296,6 +342,24 @@ the stream in sync.
 > each read the other's reply. That was a real bug, and its symptom was
 > `Bad magic 0x7b226572` — which is `{"er`, a JSON body read as a header.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Calling `producer.send()` is asynchronous and non-blocking — it buffers records into a `RecordAccumulator` and returns a Future immediately. A background sender thread wakes when batches reach `batch_size` or when `linger_ms` expires, batching writes over the wire. This batching amortized per-request network and disk overhead, boosting throughput 12x (from 3,764 to 45,082 msg/s)."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"The produce path begins when client code calls `producer.send(topic, value, key)`. The most vital operational concept is that `send()` does not touch the network — it buffers and returns a `Future` immediately.
+  >
+  > First comes partition routing: the producer queries its cached metadata for partition count. If a key is present, `partition_for_key` hashes it using 32-bit Murmur2 masked with `& 0x7fffffff` (matching Java Kafka's sign arithmetic and avoiding Python's randomized process seed). If no key is provided, the sticky partitioner routes all consecutive records to the same partition until that partition's batch fills, preventing round-robin scattering where batches fill 4x slower.
+  >
+  > Second is buffering: records append to a thread-safe `RecordAccumulator`. Each `(topic, partition)` tuple maintains an active `ProducerBatch`. When an append causes a batch to reach `batch_size`, the accumulator notifies the background sender thread's condition variable.
+  >
+  > Third is transmission: a dedicated background `Sender` thread loops calling `wait_for_work()`, waiting on the condition variable with a timeout of `linger_ms`. When `linger_ms` expires or a batch becomes full, the sender drains pending batches, groups them into a single `PRODUCE v1` request containing multiple partitions, and transmits it over the TCP connection.
+  >
+  > Fourth is future resolution: when the broker responds, it returns a single `base_offset` and an error code per partition. The sender thread iterates through the batch, sets each record's future result to `base_offset + index`, and wakes awaiting application threads. If a partition failed, only that partition's batch is failed or retried with exponential backoff and randomized jitter.
+  >
+  > For `acks=0`, the producer sends the payload and returns `None` immediately without waiting. Crucially, the broker handler detects `acks=0` and writes zero bytes back. If the broker sent an unread response, leftover bytes in the TCP stream would misalign the framing header on the next request, causing corrupted magic errors."*
+- **Key mechanism to highlight**: Sticky partitioning batches keyless records to the same partition until full, maximizing batch density. Murmur2 hashing with `& 0x7fffffff` matches Java Kafka and avoids Python's randomized hash seed.
+- **Trap / Follow-up**: *"How does `acks=0` work over TCP?"* → The producer writes bytes and immediately returns without waiting. The broker processes the message and intentionally replies with *nothing*. If the broker sent an unread response, leftover bytes on the TCP socket would desynchronize framing and corrupt the next request header.
+
 ---
 
 ## 4. Write it to disk
@@ -401,6 +465,22 @@ and this runs on **every append**. That was a real bug: an O(n) call on the hot
 write path made append cost quadratic in segment size. No test caught it;
 re-reading the code did.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Produce writes hop from the asyncio loop to a worker thread pool via `run_in_executor`. Inside the partition, a threading lock serializes appends to ensure contiguous, non-duplicate offsets. Each record is prefixed with a 4-byte length and a CRC32 checksum, appended to the active segment, and flushed to the OS page cache (fsync is skipped by default)."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When a produce request arrives on the broker's asyncio event loop, `_handle_produce_v1` unpacks the records. Because file I/O operations block the OS thread, the broker immediately offloads disk appending to a worker thread pool using `run_in_executor(None, partition.append, records)`.*
+  >
+  > *Inside the executor thread, execution enters `Partition.append`. Here, a threading lock (`self._lock`) is acquired. This lock is load-bearing: because the executor is a multi-threaded pool, two produce requests for the same partition run concurrently on separate OS threads. Without the partition lock, both threads could read `next_offset = 41` simultaneously and both write records claiming offset 41, causing duplicate offsets and skipping offset 42. The lock guarantees the foundational invariant that an offset names exactly one message.*
+  >
+  > *Inside `Log.append`, the log checks if the active segment must roll (if `size >= segment_bytes` or `time >= segment_ms`). It then encodes each record in `Segment.append`: each record is structured with a 4-byte payload length, a 4-byte CRC32 checksum, and the raw serialized payload. The CRC32 checksum allows readers to verify that bytes have not been torn or corrupted before parsing JSON.*
+  >
+  > *The record is written to the `.log` file descriptor and immediately followed by `file.flush()`. This flushes Python's internal buffer into the operating system page cache, making the data instantly visible to concurrent readers. However, `os.fsync()` is intentionally omitted by default. In distributed log architectures, durability is achieved through multi-broker replication, not single-machine fsync. Paying 1–10 ms per write for disk platter sync would throttle throughput from 45,000 to ~100 msgs/sec.*
+  >
+  > *Finally, if the bytes written since the last index entry exceed `index_interval_bytes` (4 KB), a new sparse index entry `(offset, byte_position)` is appended to the companion `.index` file, keeping index overhead to a negligible 0.2% of the log."*
+- **Key mechanism to highlight**: The partition write lock preserves the golden rule: 'an offset names exactly one message'. Without it, concurrent executor threads would produce duplicate offsets. CRC32 ensures torn writes on crash are detected before being served to consumers.
+- **Trap / Follow-up**: *"Why does Kafka flush to OS page cache instead of fsyncing every message?"* → `fsync` takes 1–10 ms (physical platter seek / SSD erase block sync), limiting throughput to ~100 writes/sec. Page cache takes ~1 µs (~100,000 writes/sec). In distributed systems, durability is bought with multi-node replication, not local disk fsync.
+
 ---
 
 ## 5. Roll a segment
@@ -434,6 +514,22 @@ A low-traffic topic whose single segment never fills would keep its data
 forever regardless of policy.
 
 Measured index overhead on a real run: **0.19% of the log**.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Logs are split into segment files named after their 20-digit zero-padded base offset. When an active segment exceeds `segment_bytes` or `segment_ms`, it is sealed into an immutable file and a new active segment is created. Alongside each `.log` file sits a sparse `.index` mapping offset to byte position every 4 KB, consuming only ~0.2% disk overhead."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"A partition log is not a single monolithic file; it is a directory of segmented files. Flow 5 manages segment rolling in `Log._maybe_roll()`.*
+  >
+  > *Each segment consists of two companion files: `00000000000000000000.log` (storing raw records) and `00000000000000000000.index` (storing sparse offset-to-byte positions). The filename is strictly formatted as a 20-digit zero-padded string representing the base offset of the first record in that segment.*
+  >
+  > *During every append, `_maybe_roll` checks two thresholds on the active segment: size and age. If `size_bytes >= segment_bytes` (e.g. 10 MB or 1 GB), or if `segment_ms` has elapsed since segment creation, the segment is sealed. Sealing marks the segment as immutable and closes its append file handle. A new segment is immediately created whose base offset is `active.next_offset`.*
+  >
+  > *Zero-padding to 20 digits is not cosmetic — it is a critical algorithmic choice. In Python, `sorted(os.listdir(partition_dir))` sorts filenames lexicographically. Without fixed-width padding, `"10000.log"` would sort before `"20.log"`, corrupting offset ordering. With 20-digit zero padding, alphabetical sort perfectly equals numeric offset sort without needing custom parsing.*
+  >
+  > *Furthermore, rolling by time via `segment_ms` is essential for retention. Log retention policies (like deleting data older than 7 days) only ever delete sealed segments — the active segment currently receiving appends is never eligible for deletion. On a low-throughput topic where messages arrive slowly, a segment might take months to fill by size alone; without `segment_ms`, old data would sit in the active segment and escape retention indefinitely."*
+- **Key mechanism to highlight**: 20-digit zero-padded filenames allow lexical sorting (`sorted(os.listdir())`) to naturally match offset order. `segment_ms` guarantees low-traffic partitions eventually roll sealed segments so retention can clean them up.
+- **Trap / Follow-up**: *"Can retention delete data from the active segment?"* → Never. Retention only purges sealed segments. If segments didn't roll by time (`segment_ms`), a trickle of data on an old partition would never be deleted.
 
 ---
 
@@ -498,6 +594,118 @@ beginning; 295 messages vanish with no error anywhere. The broker turns this
 empty result into `OFFSET_OUT_OF_RANGE`
 ([broker.py:418](../broker/broker.py#L418)) — the honest answer.
 
+### The second bound — the high watermark (Phase 6)
+
+The same read path now takes an exclusive upper limit, and who is asking
+decides whether it applies:
+
+```python
+# broker/broker.py — _handle_fetch
+replica_id = payload.get('replica_id')
+if replica_id is not None:
+    self.cluster.record_replica_position(topic, part_id, replica_id, start_offset)
+
+watermark = self.cluster.high_watermark(topic, part_id, partition.next_offset)
+limit = None if replica_id is not None else watermark
+messages = await self._run_blocking(partition.fetch, start_offset, max_msgs, limit)
+```
+
+Two things happen in those five lines.
+
+**The request is the progress report.** A follower asking for offset 150 has,
+by asking, proved it holds 0..149. No acknowledgement message and no reporting
+API — which also means the leader learns each position one round trip late, so
+the watermark is permanently a little conservative. That is the right direction
+for a safety bound to be wrong in.
+
+**Consumers are clamped and followers are not**, and the asymmetry is circular:
+the act of a follower reading a record is what *makes* it safe for consumers.
+Clamp followers too and nothing replicates past the watermark, so the watermark
+never advances, so nothing is ever readable — a cluster deadlocked at offset 0
+while looking perfectly healthy.
+
+The clamp is a cap on how many records to read, not a filter afterwards
+([log.py](../broker/log/log.py)), so a consumer sitting at the watermark does
+the same small seek it always did instead of reading a batch and discarding it.
+
+### Replication — the fetch path, used by a broker
+
+```
+ReplicaFetcher._follow()          one task per followed partition
+  └─ replica.py  _fetch_once()
+     ├─ local.next_offset                       ask from our own log end
+     ├─ FETCH {replica_id: N}  →  the leader    unclamped, per above
+     └─ partition.py  append_replicated()
+        └─ log.py  Log.append_replicated()      offsets COPIED, never assigned
+```
+
+`Log.append` stamps `next_offset` onto each record, which is right for a leader
+— deciding a message is number 41 is the leader's job. A follower doing the
+same would be re-deciding it, and the moment two logs differ by one record
+every later offset names a different message on the two machines. So
+`append_replicated` copies the number, skips records at or before its own end
+(a restart legitimately re-fetches them), and raises on a gap rather than
+writing a log with a hole in it.
+
+### `acks=all` — waiting for the watermark
+
+```
+_handle_produce_v1(acks='all')
+  ├─ _enough_replicas()          committed ISR ∩ observed ISR
+  │    └─ < min.insync           → NOT_ENOUGH_REPLICAS, BEFORE the append
+  ├─ _append_records()           the write itself
+  └─ _await_replication()        poll until hw > offset, else REQUEST_TIMED_OUT
+```
+
+Three things worth noticing.
+
+**`acks=all` counts nothing.** The high watermark already means "every in-sync
+replica has this", so waiting for `hw > offset` is the entire implementation.
+No per-follower bookkeeping and no acknowledgement protocol — Step 3 built the
+mechanism, Step 5 consults it.
+
+**The ISR check is the intersection of committed and observed**, not either
+alone. A leader cut off from the quorum cannot *commit* the news that its
+followers have gone, so trusting the committed set it would keep acknowledging
+writes claiming three copies while holding one. The intersection can only ever
+be smaller, which is the safe direction.
+
+**The check runs before the append.** Writing first and failing the
+acknowledgement would leave the record in the leader's log, where a later ISR
+recovery would replicate it — so a producer told FAILED would find its message
+in the topic anyway.
+
+### Long-polling — why an empty fetch is held, not answered
+
+```
+_handle_fetch()
+  └─ no messages and max_wait_ms > 0
+       └─ poll every 2 ms until data lands or the window expires
+```
+
+Without this, a caught-up follower sleeps between fetches and only discovers a
+new record when it next wakes — so `acks=all` waits for the follower's *poll
+interval* rather than for the network. Measured: 218 ms per message, an
+`acks=all` cost of **358x**. Holding the request instead costs one parked
+coroutine and returns the instant a record arrives. 358x → ~6x.
+
+### The ISR — observed by leaders, committed by the controller
+
+```
+follower FETCH → cluster.record_replica_position()   timestamps the fetch
+                                    │
+leader heartbeat ── isr_report ──►  controller
+                                    └─ _observed_isr()  own | reported | committed
+                                       └─ raft.propose(ASSIGN_PARTITIONS)
+                                          └─ cluster.set_placement()
+```
+
+Only a partition's **leader** sees its followers' fetches, and the controller
+usually leads none of the partitions it is placing — so leaders report on the
+heartbeat they were already sending, and a report is believed only from the
+broker that actually leads that partition. The first version omitted this and
+the ISR froze at the value it had before any follower first fetched.
+
 ### Round-robin across partitions
 
 ```python
@@ -512,6 +720,26 @@ self._next_partition_index = (self._next_partition_index + 1) % len(assignment)
 Always starting at partition 0 would starve later partitions whenever the first
 has enough messages to fill `max_messages` — a consumer that silently never
 reads half its assignment.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Consumers fetch messages via a two-stage binary search: first binary searching segment base offsets to locate the target segment, then binary searching the sparse index to find the nearest file offset, followed by a short sequential scan (≤4 KB). This makes read latency flat O(1) regardless of whether the log holds 1,000 or 1,000,000 records. Consumers are clamped to the high watermark, while replica followers fetch unclamped."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When `consumer.poll()` runs, it iterates through its assigned partitions round-robin to prevent partition starvation. For each partition, it sends a `FETCH` request to the partition leader with `start_offset` and `max_messages`.
+  >
+  > On the broker, `_handle_fetch` resolves the segment via a two-stage binary search:
+  >
+  > 1. `_segment_index_containing(start_offset)` binary searches the sorted base offsets of all segments to locate the segment holding this range.
+  > 2. Inside that segment, `index.lookup(start_offset)` uses binary search (`bisect_right - 1`) on the sparse index to find the largest indexed offset at or before `start_offset`, returning its byte position in the `.log` file.
+  > 3. The broker seeks directly to that byte position and scans forward sequentially, verifying record lengths and CRC32 checksums until `start_offset` is reached. It reads up to `max_messages` and returns. Because the sparse index has entries every 4 KB, the sequential scan never reads more than ~4 KB of disk. This yields flat O(1) latency — measured at 1.07x seek ratio from offset 0 to 17,777 across 20,000 messages.
+  >
+  > In a replicated cluster (Phase 6), the broker inspects who is fetching:
+  >
+  > If a regular consumer is fetching, the read is strictly clamped to the **high watermark** — the highest offset replicated to all in-sync replicas (ISR). Any record above the watermark exists only on the leader and is withheld from consumers, preventing them from acting on records that a leader failover might wipe out.
+  >
+  > If a replica follower is fetching (passing `replica_id`), the read is unclamped! Followers must read past the watermark because follower fetching is the exact mechanism that advances the watermark. If followers were clamped, the cluster would deadlock at offset 0. Furthermore, long-polling holds empty follower fetch requests for up to `max_wait_ms` rather than returning immediately, slashing `acks=all` latency from 358x to 6x."*
+- **Key mechanism to highlight**: The sparse index contract ('at or before, never past') ensures zero records are skipped. Followers pull using the exact same FETCH API, but passing `replica_id` proves follower progress without separate ack RPCs.
+- **Trap / Follow-up**: *"Why are consumers clamped to the high watermark while follower replicas are unclamped?"* → Followers fetching data is the very mechanism that advances the high watermark. Clamping followers would create a circular deadlock where the watermark never moves and the cluster freezes at offset 0.
 
 ---
 
@@ -612,6 +840,29 @@ situations collapsed into the more alarming one.
 Fencing is unaffected — an *evicted* member is removed from `members` entirely
 and fails the membership check regardless of generation.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Consumer group partition assignment uses a two-phase protocol: `JOIN_GROUP` and `SYNC_GROUP`. The coordinator holds join requests in purgatory until all members arrive. The first member elected as group leader computes the partition assignment on the client side, then submits it via `SYNC_GROUP` for the coordinator to distribute to followers."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Consumer group membership is orchestrated by a two-phase protocol: `JOIN_GROUP` followed by `SYNC_GROUP`.
+  >
+  > When an application invokes `consumer.subscribe()`, the consumer checks `_ensure_joined()`. It transmits a `JOIN_GROUP` request containing its `member_id` (initially blank on first join) and topic subscriptions.
+  >
+  > On the broker, `GroupCoordinator.join_group` manages the rendezvous:
+  > If the group is `STABLE`, it transitions to `PREPARING_REBALANCE`. The coordinator intentionally does not answer the request immediately — it parks the connection on an asyncio `Event` (Kafka's purgatory) and waits up to `rebalance_timeout_ms` for all known group members to check in.
+  >
+  > Once all members have called `JOIN_GROUP` (or the timeout fires), `complete_join()` increments `generation_id` and wakes all parked coroutines.
+  >
+  > The response designates the first consumer to join as the **group leader** and provides it with the full roster of active members and their subscriptions. All other consumers receive a response identifying them as followers without member lists.
+  >
+  > The group leader executes the partition assignment algorithm locally on the client using its configured assignor (Range or Round-Robin). It then sends `SYNC_GROUP` containing the full partition assignment map to the coordinator.
+  >
+  > Follower consumers simultaneously send `SYNC_GROUP` with empty payloads. The coordinator stores the leader's assignment and replies to each member with only its assigned partitions.
+  >
+  > Decoupling assignment policy from the broker is a massive architectural win: custom partition assignment logic (rack-aware, stream joins, sticky) can be upgraded in client application libraries without touching broker servers."*
+- **Key mechanism to highlight**: Computing assignment on the client keeps partition assignment policy decoupled from broker deployment — custom assignors (range, round-robin, sticky) ship with client code without broker upgrades.
+- **Trap / Follow-up**: *"Why does the coordinator hold `JOIN_GROUP` requests in purgatory instead of responding immediately?"* → The group leader cannot compute a balanced assignment until the full member roster is known. Asyncio event waiting allows the broker to hold hundreds of connections in purgatory with negligible memory.
+
 ---
 
 ## 8. Commit an offset
@@ -701,6 +952,25 @@ fetch ──► commit ──► process        fetch ──► process ──�
 There is no third option: a crash can always land between "did the work" and
 "recorded that I did it".
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Offset commits persist consumer progress to an internal append-only topic `__consumer_offsets`. Every commit includes a `generation_id` and `member_id`. If an evicted consumer wakes up from a long GC pause and attempts to commit, the coordinator fences it with `ILLEGAL_GENERATION`, preventing stale zombies from rewinding group progress."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When a consumer finishes processing a batch, it calls `consumer.commit()`. This constructs an `OFFSET_COMMIT` request containing the topic, partition, offset, `member_id`, and `generation_id`.
+  >
+  > On the broker, `_handle_offset_commit` executes a critical four-line fence in `_check_member`:
+  >
+  > 1. It verifies `member_id in group.members` (ensuring the consumer was not evicted).
+  > 2. It verifies `generation_id == group.generation_id`.
+  >
+  > Suppose consumer A paused for a 40-second garbage collection freeze. The coordinator timed it out, bumped the generation to 8, and reassigned its partition to consumer B. Consumer B reads from offset 100 and commits offset 150. When paused consumer A wakes up, it still believes it is in generation 7 and attempts to commit offset 120. The coordinator immediately rejects the commit with `ILLEGAL_GENERATION`. Without this fence, the zombie consumer would silently overwrite and rewind the group's committed offset from 150 back to 120, causing 30 messages to be reprocessed.
+  >
+  > Once validated, `OffsetStore.commit` follows write-ahead log semantics: it appends the commit record to the on-disk partition log `__consumer_offsets` first, and updates the in-memory hash map second. If the broker crashes between the two steps, startup replay reads the log and reconstructs the committed map without data loss.
+  >
+  > The placement of `commit()` in application code governs delivery guarantees: committing before processing gives at-most-once delivery (a crash loses data); committing after processing gives at-least-once delivery (a crash duplicates messages, which is curable with idempotent handling)."*
+- **Key mechanism to highlight**: Generation fencing guarantees that only the current partition owner can commit offsets. On disk, commits write to `__consumer_offsets` log first before updating the in-memory lookup table, ensuring crash recovery via replay.
+- **Trap / Follow-up**: *"What is the trade-off between committing before vs after processing?"* → Committing before processing is at-most-once (crashes lose data silently). Committing after processing is at-least-once (crashes duplicate data). At-least-once is the only safe default because duplication is visible and curable via idempotency.
+
 ---
 
 ## 9. Detect a dead consumer
@@ -773,6 +1043,24 @@ in `Stable`, holding partitions for processes that no longer exist.
 **Measured:** with `session_timeout_ms=800`, a killed member's partitions are
 taken over in **~1.0 s**.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Consumer liveness is maintained by a dedicated background heartbeat thread using an independent TCP connection. If heartbeats stop for `session_timeout_ms`, the coordinator evicts the member and triggers a rebalance. Eviction is driven by a periodic background timer (`reap_expired`), taking over failed partitions in ~1.0s."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Consumer liveness is monitored through a dedicated background heartbeat loop.
+  >
+  > In the consumer process, `_heartbeat_loop` runs on its own OS thread using its own dedicated TCP socket connection (`_heartbeat_conn`). Running on a separate thread ensures that expensive or slow record processing in the application loop does not block heartbeats and cause false-positive evictions. Running on a separate socket ensures heartbeats never queue behind large multi-megabyte `FETCH` responses on the socket buffer.
+  >
+  > Every `heartbeat_interval_ms` (e.g. 300 ms), the thread sends a `HEARTBEAT` request. On the broker, `GroupCoordinator.heartbeat` verifies the member and generation, and updates the member's `last_heartbeat` monotonic timestamp. If the group is currently rebalancing, the coordinator replies with `REBALANCE_IN_PROGRESS`, prompting the consumer to rejoin.
+  >
+  > On the broker, a background asyncio task `_group_reap_loop` runs every `group_reap_ms` calling `coordinator.reap_expired()`. It checks if `now - last_heartbeat > session_timeout_ms`. If a member has gone silent, the coordinator removes it from `group.members` and transitions the group to `PREPARING_REBALANCE`.
+  >
+  > Crucially, members parked in purgatory during `JOIN_GROUP` are excluded from eviction — a consumer waiting for a rebalance to finish is active by definition.
+  >
+  > Having the reaper run on a periodic timer is essential: if all consumers in a group crash simultaneously, no inbound requests ever arrive again; the timer ensures abandoned partitions are reclaimed within ~1.0 second."*
+- **Key mechanism to highlight**: Using a separate connection and thread for heartbeats isolates liveness from data processing. Purgatory join requests count as active liveness so rebalancing members are not prematurely evicted.
+- **Trap / Follow-up**: *"What happens if a consumer's processing thread deadlocks but its heartbeat thread keeps running?"* → The heartbeat thread would keep the consumer alive indefinitely. Real Kafka introduced `max.poll.interval.ms` (checking time between `poll()` calls) to detect processing stalls independently of network heartbeats.
+
 ---
 
 ## 10. Where a consumer starts reading
@@ -843,6 +1131,27 @@ auto-create the topic. But an empty partition starts at 0 whichever end you
 asked for, so failing would force the caller to handle a distinction with no
 consequence.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"When a consumer starts, it calls `OFFSET_FETCH`. If a committed offset exists, it resumes from there. If no offset was ever committed (-1), it queries `LIST_OFFSETS` and applies `auto_offset_reset`: `earliest` seeks to the log start, while `latest` seeks to the log end (the high watermark). Offset -1 and offset 0 are strictly distinct."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When a consumer initializes its assigned partitions, it calls `_refresh_positions()`. It does not assume offset 0.
+  >
+  > First, it issues an `OFFSET_FETCH` request to the broker. `OffsetStore.fetch` looks up `(group_id, topic, partition)`. If a committed offset exists, the consumer initializes its fetch cursor to that offset and resumes consumption seamlessly.
+  >
+  > Second, if no committed offset exists, the store returns `-1`. The distinction between `-1` and `0` is vital: `0` means the group explicitly committed offset 0; `-1` means the group has never committed anything for this partition.
+  >
+  > When offset is `-1`, the consumer applies its configured `auto_offset_reset` policy:
+  >
+  > If `auto_offset_reset = 'earliest'`, it sends `LIST_OFFSETS` with timestamp `EARLIEST` to discover the oldest available offset (the base offset of the oldest active segment) and seeks there.
+  > If `auto_offset_reset = 'latest'`, it sends `LIST_OFFSETS` with timestamp `LATEST` to discover the log end offset (the high watermark) and positions its cursor at the tail.
+  >
+  > Crucially, when applying `auto_offset_reset`, the consumer sets its in-memory fetch position to the resolved offset, but leaves its committed offset as `-1`. This ensures that subsequent calls to `commit()` record the position only after messages are genuinely processed.
+  >
+  > Finally, if a consumer attempts to fetch an offset smaller than `log_start_offset` (because log retention deleted older segments), the broker returns `OFFSET_OUT_OF_RANGE`, forcing the consumer to re-evaluate its reset policy rather than reading corrupted gaps."*
+- **Key mechanism to highlight**: Differentiation between -1 (no record ever committed) and 0 (explicitly committed to the first record). If a consumer's committed offset has been purged by retention, the broker returns `OFFSET_OUT_OF_RANGE`.
+- **Trap / Follow-up**: *"What is the operational danger of `auto_offset_reset=latest`?"* → If a new consumer group deploys or an existing group's offsets expire, `latest` silently jumps to the end of the log and skips all historic backlogs without error. `earliest` is safer because re-processing duplicates beats silent data omission.
+
 ---
 
 ## 11. Assignment strategies
@@ -911,6 +1220,22 @@ Sorting in `_all_partitions` ([assignor.py:64](../consumer/assignor.py#L64)) is
 load-bearing: iterating a set unsorted would produce a different layout from
 identical inputs on every rebalance, moving partitions for no reason.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"We implement Range and Round-Robin partition assignment on the client side. Range assigns contiguous partition blocks per topic to preserve co-partitioning (critical for stream joins). Round-robin deals partitions out across all group members to maximize balance and minimize skew across multiple topics."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When consumer group rebalancing enters `SYNC_GROUP`, the group leader executes partition assignment on the client. Our codebase implements two distinct assignor strategies: Range and Round-Robin.
+  >
+  > 1. **RangeAssignor**: For each subscribed topic, it divides the total partitions by the number of subscribed members (`divmod(count, len(members))`). It assigns contiguous slices of partitions to members in sorted order.
+  > The primary advantage of Range is **co-partitioning**: if an application consumes two topics (e.g. `orders` and `payments`) that have identical partition counts and are keyed identically, Range assigns `orders-0` and `payments-0` to the exact same consumer process. This is mandatory for stateful stream joins.
+  > The disadvantage is **partition skew**: if partition counts don't divide evenly (e.g. 3 partitions over 2 consumers), consumer 0 gets the remainder partition. Across 10 topics, consumer 0 gets 20 partitions while consumer 1 gets only 10, causing a 2x workload imbalance.
+  >
+  > 2. **RoundRobinAssignor**: It collates all partitions across all topics in a deterministic sorted list and deals them out one by one across all consumers. This guarantees that workload skew never exceeds 1 partition across the entire cluster. However, co-partitioning is lost. Furthermore, the assignor explicitly skips members that didn't subscribe to a given topic.
+  >
+  > Both assignors strictly enforce the invariant that **every partition is assigned to exactly one member**. Assigning zero times drops a partition; assigning twice duplicates processing. Both algorithms sort member IDs and partition lists before calculating to guarantee deterministic assignments that avoid churn across identical rebalance inputs."*
+- **Key mechanism to highlight**: Assignment is deterministic and strictly enforced to ensure every partition is assigned to exactly one member. Both algorithms sort member IDs and partition lists first to prevent churn between rebalances.
+- **Trap / Follow-up**: *"What is the main drawback of Range assignment?"* → If multiple topics have partition counts not evenly divisible by member count (e.g., 3 partitions over 2 consumers across 10 topics), member 0 consistently gets the extra partition for all 10 topics, creating a 66/33 workload imbalance.
+
 ---
 
 ## 12. Leave a group cleanly
@@ -957,6 +1282,29 @@ except (KafkaError, BrokerConnectionError):
 
 Failing to leave cleanly costs a session timeout, not correctness. Raising here
 would mask whatever the caller was actually shutting down for.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"When a consumer shuts down cleanly, `close()` immediately sends a `LEAVE_GROUP` request. The coordinator removes the member and begins a rebalance instantly, avoiding the multi-second stall that would otherwise occur while waiting for `session_timeout_ms` to expire."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When a consumer application shuts down gracefully, `consumer.close()` executes a clean departure sequence:
+  >
+  > 1. It stops the background heartbeat thread (`_stop_heartbeat()`). Cancelling the heartbeat thread *before* sending `LEAVE_GROUP` is vital: otherwise, an in-flight heartbeat packet could arrive at the broker immediately after the leave request, inadvertently resurrecting the member.
+  > 2. It sends an explicit `LEAVE_GROUP` request to the coordinator.
+  > 3. It closes all underlying TCP sockets.
+  >
+  > On the broker, `coordinator.leave_group` handles the request:
+  > If the member exists, it deletes the member from `group.members`. If the departing member was the group leader, it selects the next available member as the new leader.
+  >
+  > Then, it invokes `group.begin_rebalance()`, transitioning the group to `PREPARING_REBALANCE`.
+  >
+  > Crucially, it begins the rebalance, but does NOT complete it. The coordinator must wait for surviving members to rejoin. Surviving members find out about the rebalance on their next heartbeat, which returns `REBALANCE_IN_PROGRESS`, prompting them to rejoin immediately.
+  >
+  > Why have `LEAVE_GROUP` at all? Without an explicit leave API, the coordinator has no way of knowing a consumer stopped; it must wait for the consumer's `session_timeout_ms` (e.g. 10–30s) to expire before triggering a rebalance. On every rolling deploy, an explicit `close()` avoids tens of seconds of halted consumption.
+  >
+  > Notice also that `close()` wraps `LEAVE_GROUP` in best-effort exception suppression (`try/except: pass`): if the network is broken during shutdown, the consumer must terminate cleanly without hanging."*
+- **Key mechanism to highlight**: The coordinator begins rebalance but does *not* complete it immediately (`begin_rebalance()`, not `complete_join()`). Surviving members discover the rebalance on their next heartbeat (`REBALANCE_IN_PROGRESS`) and rejoin.
+- **Trap / Follow-up**: *"Why is the LEAVE_GROUP call wrapped in best-effort exception suppression (`try/except: pass`)?"* → If network failure prevents `LEAVE_GROUP` from reaching the broker, the consumer should still terminate cleanly. The coordinator will evict it anyway when its session timeout expires.
 
 ---
 
@@ -1015,6 +1363,25 @@ would produce nonsense.
 > legitimately shares the socket. The right answer depended on whether the
 > sharing was legitimate — not on a rule about locks.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Kafka provides two consumption models: dynamic group coordination via `subscribe()` and static manual partition assignment via `assign()`. They are strictly mutually exclusive. Manual assignment bypasses the coordinator, heartbeat threads, rebalances, and generation fencing, giving the developer raw offset control."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Kafka offers two mutually exclusive consumption modes: `subscribe()` (dynamic group management) and `assign()` (static manual partition assignment).
+  >
+  > When an application calls `consumer.assign([('orders', 2)])`, it explicitly claims ownership of specific partitions:
+  > It sets `self.subscription = []`, signifying that no group coordinator is used. It invokes `_refresh_positions()` to resolve starting offsets, and begins polling.
+  >
+  > Notice what is absent: there is no `JOIN_GROUP`, no `SYNC_GROUP`, no background heartbeat thread, and no `generation_id`. When committing offsets in manual mode, `member_id` and `generation_id` are omitted; the broker's `_handle_offset_commit` skips member validation and applies the commit directly.
+  >
+  > The trade-off is clear: you gain absolute control (zero rebalance pauses, zero heartbeat network traffic, deterministic assignment), but you sacrifice fault tolerance (if the consumer dies, no other consumer automatically takes over its partitions). Manual assignment is designed for specialized partition-repair utilities, ETL batch extractors, or stream processors (like Flink) that manage partition assignment in their own stateful coordinator.
+  >
+  > To prevent concurrency bugs, `Consumer` guards `subscribe`, `assign`, `poll`, and `commit` with `_exclusive`: a non-blocking lock (`acquire(blocking=False)`). If another thread is already inside the consumer, it immediately raises `RuntimeError`.
+  >
+  > Why refuse with an error instead of using a mutex to serialize concurrent calls? Because a consumer maintains mutable internal cursor state (`position` and `assignment`). Two application threads sharing one consumer would interleave reads and offset commits, creating chaotic non-deterministic bugs. Refusing immediately forces the developer to fix the concurrency architecture."*
+- **Key mechanism to highlight**: The `_exclusive` non-blocking thread guard raises `RuntimeError` immediately if multiple threads invoke consumer methods simultaneously. Consumers are strictly not thread-safe by design because they track mutable internal read cursors.
+- **Trap / Follow-up**: *"Why does the consumer reject concurrent threads with an error rather than using a mutex to serialize them?"* → Serializing calls with a lock would mask a fatal application bug: two threads sharing one consumer share its partition offsets and assignment, causing chaotic interleaving. Refusing immediately exposes the design flaw.
+
 ---
 
 ## 14. Rebalance edge cases
@@ -1071,6 +1438,19 @@ show a healthy group consuming nothing.
 Covered in [§9](#9-detect-a-dead-consumer), but it belongs on this list: acting
 on an obsolete `REBALANCE_IN_PROGRESS` starts a *new* rebalance on a group that
 had just stabilised, and the group never converges.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Rebalances handle three critical failure modes: slow members that fail to rejoin within `rebalance_timeout_ms` (they are dropped and the group completes without them), leaders that die before submitting assignments (the coordinator times out and forces a new rebalance), and whole-group death (cleaned up by a periodic background reaper)."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"A consumer group rebalance is a distributed rendezvous prone to timing edge cases. Our coordinator explicitly handles four failure scenarios:
+  >
+  > 1. **A member never rejoins**: When a rebalance begins, the coordinator waits up to `rebalance_timeout_ms` for all members in `group.members` to call `JOIN_GROUP`. If a consumer crashes or network-partitions during the rebalance window, the timeout expires. The coordinator does not hang forever — it removes the absent members from `group.members`, reassigns the group leader if the leader went missing, and calls `complete_join()`. The rebalance finishes with the surviving members. If it didn't drop absent members, partitions would be assigned to a dead consumer and sit unconsumed indefinitely.
+  > 2. **The leader dies before uploading the assignment**: After `JOIN_GROUP` finishes, the coordinator waits for the elected group leader to upload partition assignments via `SYNC_GROUP`. If the leader process crashes or pauses before sending `SYNC_GROUP`, follower consumers waiting in purgatory would deadlock. The coordinator enforces a timeout: when the leader times out, it aborts the rendezvous and invokes `begin_rebalance()`, kicking off a new election cycle where another member becomes leader.
+  > 3. **Every member dies simultaneously**: If power is cut to an entire consumer rack, all members die at once. Because no incoming heartbeats arrive, passive request-driven eviction would never trigger. The broker runs a periodic timer loop `_group_reap_loop` that sweeps dead members and transitions the group to `EMPTY`.
+  > 4. **Stale heartbeat reply after rejoin**: If a delayed heartbeat packet sent during generation 7 arrives at the client after generation 8 has already stabilized, the response says `REBALANCE_IN_PROGRESS`. The client checks whether its current generation matches the generation when the heartbeat was sent; if stale, it ignores the signal, preventing an infinite cascading rebalance storm."*
+- **Key mechanism to highlight**: Dropping non-responsive members at timeout expiry is vital — if the coordinator waited forever, a single stalled process would freeze the entire consumer group indefinitely.
+- **Trap / Follow-up**: *"What is the 'stop-the-world' cost of an eager rebalance protocol?"* → In eager rebalancing, all consumers revoke their partitions and pause processing while waiting in purgatory. For large clusters, cooperative sticky rebalancing allows unaffected partitions to continue processing during the rebalance.
 
 ---
 
@@ -1147,6 +1527,27 @@ Always "me", because there is one broker. The API exists now so that **Phase 5
 adds a cluster rather than a protocol change** — real Kafka hashes the group id
 to choose a coordinator, spreading group state across brokers.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Consumer group monitoring joins data across three separate sources: `DESCRIBE_GROUPS` (active members and assigned partitions), `OFFSET_FETCH` (committed offsets), and `METADATA` (log end offsets). Consumer lag is calculated per partition as `log_end_offset - committed_offset`."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Monitoring consumer group health via `kfk groups describe --group billing` joins operational metrics across three distinct APIs:
+  >
+  > 1. `DESCRIBE_GROUPS` (API key 23): Queries the broker's `GroupCoordinator` to retrieve active group state (`Stable`, `PreparingRebalance`, `CompletingRebalance`, `Empty`), current `generation_id`, the group leader, and the list of active members with their assigned topic-partitions.
+  > 2. `OFFSET_FETCH` (API key 9): Queries `OffsetStore` to fetch the committed offset for every partition owned by the group.
+  > 3. `METADATA` / `LIST_OFFSETS` (API key 3): Queries partition leaders to get the current **log end offset** (the high watermark) for each partition.
+  >
+  > The CLI joins these three datasets to calculate **consumer lag**:
+  > `lag = max(0, log_end_offset - committed_offset)`
+  >
+  > Consumer lag is the single most critical operational metric in stream processing. A consumer can report healthy CPU, normal memory, and zero exceptions while quietly falling hopelessly behind. Lag directly measures the unprocessed message backlog.
+  >
+  > The CLI highlights a crucial warning: **committed but unassigned partitions**. If a partition has committed offsets recorded in `__consumer_offsets` but is not listed in any member's current assignment, it means consumption on that partition has stalled completely.
+  >
+  > Furthermore, `kfk groups list` joins active in-memory groups from `GroupCoordinator` with historical groups stored in `OffsetStore`. Even if every consumer in a group has shut down and the group state is `Empty`, its committed offsets remain intact and discoverable."*
+- **Key mechanism to highlight**: Identifying unassigned partitions with committed offsets flags dead or neglected topic partitions where messages are accumulating with nobody consuming them. Listing groups queries both active memory state and historic `__consumer_offsets`.
+- **Trap / Follow-up**: *"Why is consumer lag the primary SLA metric rather than latency or CPU?"* → A consumer process can show low CPU usage and zero errors while quietly falling further behind incoming traffic. Consumer lag measures actual backlog size and processing deficit directly.
+
 ---
 
 ## 16. Retention (deleting old data)
@@ -1184,6 +1585,28 @@ Two consequences worth stating:
 its answer **once the segment is sealed**. Sealed means immutable, so the cache
 cannot go stale; without it the cleaner's cost was proportional to the whole
 log, which is exactly what segments exist to avoid.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Data retention runs periodically in a background cleaner loop. It evaluates sealed segments against `retention_ms` and `retention_bytes`, deleting entire files from disk. Retention deletes complete segment files, never individual records, preserving sequential disk I/O and zero-seek performance. The active segment is never deleted."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Log retention runs as a background task `_retention_loop` every `retention_check_ms`. It delegates to `Partition.delete_old_segments()`, which calls `Log.delete_old_segments()`.
+  >
+  > The retention engine evaluates sealed segments against configured limits: `retention_ms` (time-based) and `retention_bytes` (size-based).
+  >
+  > The critical architectural principle is: **delete complete segment files, never individual records**.
+  > Removing individual records would require rewriting `.log` and `.index` files on disk, turning sequential O(1) appending into expensive random-access rewrites and destroying zero-copy sequential performance.
+  >
+  > The loop inspects segments from oldest to newest with two strict rules:
+  >
+  > 1. It loops while `len(self.segments) > 1`: the **active segment is never deleted**, ensuring the write head always has an open file to append into.
+  > 2. It calls `oldest.largest_timestamp()`. Once a segment is sealed, this timestamp is cached in memory, making retention checks O(1) without touching disk.
+  >
+  > When an expired segment is identified, `Segment.delete()` executes: it closes open file handles and unlinks both `.log` and `.index` from disk.
+  >
+  > Finally, `Log` advances `self.log_start_offset` to the base offset of the new oldest segment. This offset bound ensures that if a client requests an offset that was purged by retention, the broker immediately returns `OFFSET_OUT_OF_RANGE` rather than quietly serving missing data gaps."*
+- **Key mechanism to highlight**: Granularity is by segment, not by record. Deleting records in place would force random writes and file rewrites, destroying append performance. Cached `largest_timestamp()` on sealed segments ensures cleanup evaluation is O(1) per segment, not O(N) over all records.
+- **Trap / Follow-up**: *"What happens if a topic receives so few messages that its active segment never rolls?"* → Without `segment_ms`, an active segment that never reaches `segment_bytes` would stay open forever and its records would never be deleted regardless of `retention_ms`. `segment_ms` guarantees segments roll by time.
 
 ---
 
@@ -1238,6 +1661,26 @@ next append landing after it: permanent garbage in the middle of the log.
 
 **Verified by `chaos/corrupt_log.py`** across three damage types, including one
 that Phase 1 would have served as real data.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"On broker startup, crash recovery loads partition logs in O(1) time. All sealed segments are trusted based on their immutable file length. Only the final active segment is scanned record-by-record using CRC32 checksums. If a torn write is found at the tail (e.g. from an abrupt crash or power cut), the log and index are truncated to the last intact record."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When a broker restarts after a crash or ungraceful shutdown, `Log._load()` initializes all partition logs.
+  >
+  > Crash recovery is designed to be O(1) with respect to total data volume:
+  >
+  > 1. It reads the partition directory with `sorted(os.listdir())`. Because segment files are named using 20-digit zero-padded base offsets, sorting gives exact offset order with zero disk reads.
+  > 2. For all older, **sealed segments**, the broker trusts their immutable state. It reads file sizes via `os.path.getsize` and assigns `next_offset` as the base offset of the subsequent segment. It does NOT re-scan sealed segments. On a 500 GB drive, this avoids hours of scanning on startup.
+  > 3. Only the final **active segment** is scanned via `segment.recover()`. Because an abrupt crash or power failure can only corrupt in-flight appends at the active write head, only the active segment can contain torn writes.
+  >
+  > In `recover()`, `iter_records` reads records sequentially. For each record, it validates the 4-byte length prefix and verifies the 4-byte CRC32 checksum against the payload.
+  >
+  > If a torn write or corrupted byte is encountered, scanning stops immediately. The code truncates the `.log` file at `valid_end` using `fh.truncate(valid_end)` and trims the companion `.index` file to match.
+  >
+  > Repairing by truncation rather than skipping is mathematically mandatory: if a record length header is corrupted, you cannot know where the next record begins. Truncating the corrupted tail restores log integrity and resets `next_offset` so subsequent appends cleanly resume."*
+- **Key mechanism to highlight**: Repair by truncation rather than skipping. If a torn write occurs, the record length field cannot be trusted to locate subsequent records, so truncating the tail is the only provably safe recovery.
+- **Trap / Follow-up**: *"Why not fsync every record instead of relying on tail truncation during crash recovery?"* → Fsyncing every record reduces produce throughput by roughly 100x–1000x due to disk I/O latency. Flushing to page cache and repairing the tail on startup gives maximum write speed with corruption safety.
 
 ---
 
@@ -1315,6 +1758,23 @@ The hierarchy is shaped by **what you do about it**, not by what went wrong —
 which is why one `except RetriableError` covers every case, and why new
 retriable errors added in later phases work with existing retry loops for free.
 
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Errors are transmitted as numeric error codes matching Apache Kafka's protocol specification. The client maps them into an exception hierarchy categorized by whether the error is retriable (e.g., `NOT_LEADER_OR_FOLLOWER`, `REBALANCE_IN_PROGRESS`) or non-retriable (e.g., `INVALID_REQUEST`). Retriable errors automatically trigger exponential backoff with randomized jitter."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Error propagation is strictly structured across the network boundary:
+  >
+  > 1. On the broker, every request handler is wrapped in a unified exception boundary. Handlers raise specific Python exceptions (e.g. `NotLeaderError`, `IllegalGenerationError`, `OffsetOutOfRangeError`). The boundary catches `KafkaError` and formats a standard wire response: `{'error_code': int, 'error_message': str}`. The numeric code is for machine logic; the string message is for human debugging.
+  > 2. On the client, all responses pass through `common/errors.py:raise_for_error()`. If `error_code != NONE`, it looks up the code and raises the corresponding typed Python exception. This ensures call sites cannot accidentally ignore error responses.
+  > 3. The exception hierarchy is split by remediation action rather than root cause:
+  > - **`RetriableError`**: Errors representing transient cluster state changes (e.g. `NOT_LEADER_OR_FOLLOWER` (6), `REBALANCE_IN_PROGRESS` (27), `UNKNOWN_TOPIC_OR_PARTITION` (3), `REQUEST_TIMED_OUT` (7)). When caught, the client refreshes metadata and retries.
+  > - **Non-retriable errors**: Errors where retrying would repeat the identical failure (e.g. `OFFSET_OUT_OF_RANGE` (1), `INVALID_REQUEST` (42), `CORRUPT_MESSAGE` (2)). These bubble immediately to application code.
+  >
+  > In client retry loops, retries use exponential backoff (`backoff * 2^attempt`) capped at `max_backoff_ms`, multiplied by a randomized **jitter** factor (`0.5 + random()`).
+  > Jitter is critical: without jitter, if a leader restarts and fails requests from 50 producers simultaneously, all 50 producers retry at the exact same millisecond, creating a synchronized thundering herd that knocks the recovering leader back offline."*
+- **Key mechanism to highlight**: The distinction between retriable and non-retriable errors is the foundational primitive for client self-healing. Jitter on exponential backoff prevents thundering herd catastrophes where recovering brokers are knocked offline by synchronized retry spikes.
+- **Trap / Follow-up**: *"Why is `UNKNOWN_TOPIC_OR_PARTITION` classified as retriable?"* → During topic creation or cluster partition rebalancing, metadata propagation has a small propagation lag across brokers. A client writing to a newly created topic might reach a broker a few milliseconds before its controller update arrives; retrying allows metadata to settle.
+
 ---
 
 ## Reading order, if you want to follow one thing end to end
@@ -1324,3 +1784,566 @@ retriable errors added in later phases work with existing retry loops for free.
 **Failure handling:** §12 → §9 → §11.
 
 **What makes it distributed:** §2 → §3 (routing) → §7 (assignment).
+
+---
+
+# Part 2 — Cluster flows (Phases 5 and 6)
+
+Flows 1–18 are everything a **single broker** does. These are what happens once
+there are several, and they are where the interesting failures live.
+
+---
+
+## 19. Cluster startup and membership
+
+```
+python -m broker.broker --node-id 2 --cluster cluster.json
+  └─ broker.py  Broker.__init__()
+     ├─ ClusterConfig.load()          the static roster — this IS discovery
+     ├─ ClusterState(node_id, ...)    liveness, leader map, replica sets, ISR
+     ├─ Controller(cluster, metadata) placement
+     ├─ RaftNode(node_id, voters...)  the quorum
+     └─ ReplicaFetcher(self)          follower loops
+  └─ Broker.start()
+     ├─ raft.start()                  election timer begins
+     ├─ replicas.start() + reconcile()
+     └─ _membership_loop()            forever
+```
+
+### The membership tick — the whole cluster mechanism in one loop
+
+```python
+# broker/broker.py — _membership_loop
+while True:
+    await asyncio.sleep(interval)
+    await self._heartbeat_peers()          # who answers?
+    self._sync_metadata_from_raft()        # mirror committed topics locally
+    elected = self.cluster.set_controller(self.raft.leader_id)
+    if self.cluster.is_controller and await self.controller.recompute():
+        await self._push_controller_update()
+    self.replicas.reconcile()              # start/stop follower loops
+```
+
+Five things, in an order that matters. Liveness first, because placement
+depends on it. Leadership is **read from Raft**, not computed — that one line
+is what replaced Phase 5's `min(live_broker_ids)` and fixed split-brain.
+
+### Heartbeats are a full mesh, and must not wait
+
+```python
+# broker/broker.py — _heartbeat_peers
+for peer in peers:
+    if peer.node_id in self._heartbeats_inflight:
+        continue                            # already talking to it
+    self._heartbeats_inflight.add(peer.node_id)
+    self._spawn(self._heartbeat_and_record(peer))
+```
+
+Every broker heartbeats every other broker, so each holds its own liveness
+opinion. There is no central health checker — which is exactly what
+`chaos/split_brain.py` exploits.
+
+**The round is fired off, never awaited.** `gather` finishes with the slowest
+peer, and a dead peer is the slowest possible peer: it costs a full 2 s connect
+timeout against a 700 ms session timeout, so a healthy peer would be refreshed
+only every 2 s and spend most of its life "expired". That was journal #26 —
+`live_brokers` flapping `{1}` ↔ `{1,2}` once a second on a cluster with nothing
+wrong with it.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Brokers form a cluster from a static seed roster `cluster.json`. Each broker executes a background membership loop that heartbeats all peers in a full mesh. Liveness is tracked locally in `ClusterState`. Heartbeats are launched concurrently without awaiting the slowest peer, and socket connection failures immediately mark peers as down."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When a broker starts with `--cluster cluster.json`, it transitions from a standalone broker to a clustered peer:
+  >
+  > 1. `ClusterConfig.from_file` parses the static cluster seed roster, mapping `node_id -> (host, port)`.
+  > 2. `ClusterState` initializes local views of cluster membership, partition leadership, replica sets, and In-Sync Replicas (ISR).
+  > 3. The broker starts its Raft subsystem (`RaftNode`) and launches `_membership_loop()`, which runs continuously every interval.
+  >
+  > Inside the membership loop, the broker executes five operations:
+  >
+  > First, it calls `_heartbeat_peers()`. Every broker heartbeats all other peers in a full mesh. To prevent a single dead broker from hanging the loop, heartbeats are launched concurrently (`_spawn`) without awaiting the round. A dead node's 2-second connection timeout runs in the background, allowing healthy peers to refresh without delay. If a connection is actively refused, the peer is marked down immediately (`mark_down`).
+  >
+  > Second, it synchronizes topic metadata committed by the Raft quorum.
+  > Third, it queries Raft for the current leader ID and records it in `ClusterState.set_controller()`.
+  > Fourth, if this broker is the elected Raft leader, it executes `controller.recompute()`: it computes partition-to-broker assignments and proposes changes to Raft. If committed, it broadcasts `CONTROLLER_UPDATE` RPCs to all peers.
+  > Fifth, `replicas.reconcile()` starts or stops follower replication loops based on whether this broker leads or follows each partition.
+  >
+  > This loop embodies the core principle: **liveness is a local opinion, but controller authority is a quorum truth**."*
+- **Key mechanism to highlight**: Asynchronous fire-and-forget peer heartbeats prevent a single dead node from pacing the entire loop at its 2-second connection timeout, which previously caused healthy peers to falsely expire and flap cluster membership.
+- **Trap / Follow-up**: *"Why is cluster membership a local opinion rather than a global fact?"* → In distributed systems, a node cannot remotely determine whether a peer is dead or simply partitioned away. Each node maintains its own belief (`_last_seen` timestamp); consensus (Raft) is what reconciles these divergent views into authoritative decisions.
+
+---
+
+## 20. Electing a controller (Raft)
+
+```
+no heartbeat within election_timeout
+  └─ raft/node.py  _begin_election()
+     ├─ state.set_term(term+1, voted_for=self)   DURABLE, before asking anyone
+     ├─ _reset_election_timer()
+     ├─ check: am I already a majority?          (a 1-voter quorum is)
+     └─ for each peer: _spawn(_collect_vote())   ← spawn, never gather
+        └─ REQUEST_VOTE (api 52)
+           └─ raft/node.py  handle_request_vote()
+              ├─ term < current            → reject
+              ├─ _observe_term()           → adopt a higher term, step down
+              ├─ can_vote_for(candidate)   → one vote per term
+              ├─ log.is_up_to_date()       → THE ELECTION RESTRICTION
+              └─ state.record_vote()       DURABLE, before replying
+     └─ on a majority: _become_leader() → immediate AppendEntries
+```
+
+### Three rules, and what each one buys
+
+```python
+# broker/raft/node.py
+votes_needed = len(self.voters) // 2 + 1
+```
+
+A majority of **all** voters, not of those reachable. Two disjoint majorities
+of one set cannot exist, so two leaders in one term cannot exist. That is
+arithmetic, not best effort — and the price is that the minority side goes
+quiet even though its machines are healthy.
+
+```python
+timeout = self.election_timeout_ms * (1.0 + random.random())
+```
+
+Randomised, or every node becomes a candidate at the same instant, splits the
+vote, and times out together — forever.
+
+```python
+# broker/raft/log.py  is_up_to_date
+if other_last_term != self.last_term:
+    return other_last_term > self.last_term
+return other_last_index >= self.last_index
+```
+
+The election restriction: a candidate whose log is behind cannot win, which is
+what makes committed entries permanent. Compare the last **term** first — a
+longer log is not automatically better, because a node can accumulate many
+uncommitted entries in a term that never committed.
+
+### Counting votes as they arrive, never gathering
+
+`_collect_vote` promotes the moment a majority exists, and `_begin_election`
+**spawns** the canvass rather than awaiting it. Both were journal #24: with
+`gather`, two survivors of three would each sit for a dead peer's full timeout
+while their own election timers expired underneath them, then discard a vote
+that had been *granted* because the term had moved on. Terms climbing forever,
+no leader, with a healthy majority available.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"To prevent split-brain partition leadership, the controller is elected using Raft consensus. When a broker's randomized election timer expires, it increments `currentTerm`, votes for itself, and requests votes from peers. To win, a candidate must secure votes from a strict majority of ALL voters (`len(voters)//2 + 1`) and satisfy the election log up-to-date restriction."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"In Phase 5, controller election was naively `min(live_broker_ids)`. Under a network partition, both sides had different views of who was alive, electing two controllers and causing split-brain. We replaced this with Raft consensus (`broker/raft/`):
+  >
+  > 1. **Election Timeout**: Each broker runs an election timer randomized between `T` and `2T` (e.g. 1500–3000 ms). Randomization is crucial: if timers were identical, all nodes would become candidates simultaneously, split the vote evenly, and time out indefinitely.
+  > 2. **Becoming Candidate**: When the timer fires without receiving heartbeats, the node increments `currentTerm` and votes for itself. It persists `currentTerm` and `votedFor` to disk (`state.set_term()`) using `fsync` *before* sending any RPCs, ensuring that even after a crash, a node never votes twice in the same term.
+  > 3. **Requesting Votes**: The candidate spawns `REQUEST_VOTE` RPCs to all peers. It does not wait for all replies (`spawn`, never `gather`); it promotes to leader the exact millisecond a majority is reached.
+  > 4. **Voter Evaluation**: When a peer receives `REQUEST_VOTE`, it evaluates:
+  > - Term check: If candidate term < currentTerm, reject. If candidate term > currentTerm, update currentTerm and step down to follower.
+  > - Vote check: Has this node already voted for someone else in this term?
+  > - **Election Restriction (`is_up_to_date`)**: The voter compares candidate's last log entry against its own. It compares `last_term` first, then `last_index`. If the candidate's log is less up-to-date, the vote is rejected. This guarantees that a node missing committed entries can never win an election.
+  > 5. **Becoming Leader**: Once the candidate receives votes from a strict majority of all configured voters (`len(voters)//2 + 1`), it transitions to `LEADER` and immediately broadcasts heartbeats (`AppendEntries`) to suppress elections on peers. Because two disjoint majorities of the same set cannot exist, split-brain is mathematically impossible."*
+- **Key mechanism to highlight**: The election restriction (`is_up_to_date`) ensures a node missing committed log entries can never become leader. Durable disk persistence of `currentTerm` and `votedFor` before granting votes ensures a node never casts two votes in the same term across crashes.
+- **Trap / Follow-up**: *"What went wrong when your Raft test harness modelled dead nodes as instant silence?"* → Real dead peers block for a full connect timeout. Waiting on dead nodes stalled the election loop past follower election timeouts, causing healthy nodes to repeatedly depose their leader and terms to climb endlessly without committing anything.
+
+---
+
+## 21. Committing a metadata decision
+
+Everything the cluster agrees on takes this path. There are exactly two
+callers: `CREATE_TOPIC` and `ASSIGN_PARTITIONS`.
+
+```
+controller decides something
+  └─ raft/node.py  propose(command)
+     ├─ not leader?  → return False, caller must NOT apply
+     ├─ log.append(term, command)      fsync per entry
+     ├─ _replicate_to_all()
+     │   └─ APPEND_ENTRIES (api 53) to every voter
+     │      └─ handle_append_entries()
+     │         ├─ term check, _observe_term()
+     │         ├─ log.matches(prev_index, prev_term)   Log Matching Property
+     │         ├─ log.append_entries(entries)          truncate on conflict
+     │         └─ commit_index = min(leader_commit, last_index)
+     └─ poll until commit_index >= target
+  └─ machine.apply(entry)              only committed entries
+  └─ cluster.set_placement(...)        only now is it true locally
+```
+
+### Propose, then apply — never the other way round
+
+```python
+# broker/controller.py — recompute
+committed = await self.raft.propose({'type': 'ASSIGN_PARTITIONS', ...})
+if not committed:
+    return False                        # ← the entire point
+version = self.cluster.metadata_version + 1
+self.cluster.set_placement(assignment, version)
+```
+
+A controller that applied first and replicated afterwards would be handing out
+a map nobody agreed to — the Phase 5 split-brain failure with extra steps.
+`CONTROLLER_UPDATE` therefore carries only *committed* metadata: it is a
+delivery mechanism, not a second source of truth.
+
+### The commit rule that is easy to omit
+
+```python
+# broker/raft/node.py — _advance_commit_index
+for index in range(self.log.last_index, self.commit_index, -1):
+    if self.log.term_at(index) != self.current_term:
+        continue                        # ← Figure 8 of the Raft paper
+    replicas = sum(1 for v in self.voters if self.match_index.get(v, 0) >= index)
+    if replicas >= self.votes_needed:
+        self.commit_index = index
+```
+
+A leader may only commit an entry **from its own term** by counting replicas.
+Earlier-term entries become committed indirectly, carried along when a
+same-term entry commits. Leave the term check out and an entry replicated to a
+majority can still be overwritten by a later leader.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Metadata changes (topic creation and partition placement) are proposed to the Raft quorum as log entries. The controller appends the proposal to its Raft log and replicates it via `AppendEntries`. Once a majority acknowledges receipt, the entry commits and is applied to the in-memory state machine. Propose first, apply second — never the other way around."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"When the controller commits a cluster metadata change (such as `CREATE_TOPIC` or `ASSIGN_PARTITIONS`), it executes through `raft.propose(command)`:
+  >
+  > 1. `propose` asserts that this broker is the active Raft leader; if not, it returns `False`, and the controller immediately discards the decision.
+  > 2. The leader appends the command to its local `RaftLog` at `(current_term, command)` and invokes `fsync()` to ensure durability.
+  > 3. It broadcasts `APPEND_ENTRIES` RPCs (API key 53) to all follower voters.
+  > 4. Each follower evaluates:
+  > - Is the leader's term current?
+  > - **Log Matching Property**: Does the follower's log match the leader's `prev_log_index` and `prev_log_term`? If not, the follower rejects, causing the leader to decrement `next_index` and retry. If conflicting uncommitted entries exist, the follower truncates them and appends the leader's entries.
+  > 5. On the leader, when follower acknowledgements arrive, `_advance_commit_index()` checks whether a majority has replicated entries.
+  >
+  > Here, our implementation strictly enforces **Figure 8 of the Raft paper**: a leader may only advance `commit_index` directly for log entries originating from its *current term*. Entries from previous terms are committed only indirectly when a current-term entry reaches majority. Omitting this check allows a subtle distributed anomaly where an entry replicated to a majority can still be overwritten by a subsequent leader.
+  >
+  > Once committed, `MetadataStateMachine.apply(entry)` executes, updating local metadata. The controller then updates `ClusterState` and pushes `CONTROLLER_UPDATE` to all peers."*
+- **Key mechanism to highlight**: Figure 8 rule from the Raft paper: a leader can only commit an entry from its *current term* by counting replicas. Earlier-term entries are committed indirectly. Omitting the term check permits committed entries to be overwritten by subsequent terms.
+- **Trap / Follow-up**: *"What happens if a minority controller attempts to assign partitions?"* → The minority controller cannot obtain majority acknowledgement in Raft, so `propose()` fails. The controller discards the uncommitted decision and does not update local state or notify peers, preventing split-brain corruption.
+
+---
+
+## 22. Placing partitions
+
+```
+membership tick, or a topic was just created
+  └─ controller.py  recompute()
+     └─ assign_partitions()
+        ├─ widths from the LOCAL metadata store       (see the caveat below)
+        ├─ machine.compute_assignment(live, rf, topics)
+        │    walk the ring: leader = live[i], replicas = next RF brokers
+        ├─ _observed_isr(item)      own view | leader's report | committed
+        ├─ _elect_leader(item, live)   prefer someone in the ISR
+        └─ _stamp_epoch(item)          bump only if the leader changed
+     ├─ machine.assignment_differs()?  → no change, propose nothing
+     ├─ raft.propose(ASSIGN_PARTITIONS)
+     └─ cluster.set_placement()
+  └─ _push_controller_update()      CONTROLLER_UPDATE (api 28) to peers
+```
+
+### The ring, and why it is wrong for failover
+
+```python
+# broker/raft/machine.py — compute_assignment
+start = index % len(live)
+replicas = [live[(start + offset) % len(live)] for offset in range(factor)]
+```
+
+Walking the ring from a rotating start gives two properties for free: no broker
+appears twice in one replica set, and leadership spreads evenly. Both are easy
+to break — take the same N brokers for every partition and you replicate
+perfectly while piling every leader onto one machine.
+
+But the ring is a *placement* rule, and failover needs an *election* rule:
+
+```python
+# broker/controller.py — _elect_leader
+eligible = [n for n in item['replicas'] if n in committed_isr and n in live]
+if not eligible:
+    item['leader'] = previous          # refuse to elect; go unavailable
+    return
+current = self.raft.machine.leader_for(topic, partition)
+item['leader'] = current if current in eligible else eligible[0]
+```
+
+Prefer someone who already has the data. Keep the current leader if it is still
+eligible, because every unnecessary move costs a metadata refresh on every
+client.
+
+### The caveat worth knowing
+
+`widths` comes from the **local metadata store**, not the committed set, and
+that is uncomfortable on purpose: auto-created topics never reach the Raft log,
+so placing only committed topics would leave every auto-created partition
+unassigned and unservable. The honest fix is to propose auto-creations too.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Partition placement distributes leadership and replicas evenly across live brokers using a deterministic ring algorithm. When electing a leader during failover, the controller strictly promotes from the committed In-Sync Replica (ISR) set, never from the general broker ring, guaranteeing the new leader already holds all committed messages."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Partition placement executes on the controller via `controller.recompute()`:
+  >
+  > 1. It queries `ClusterState.live_brokers()`, which returns a deterministically sorted list of active broker IDs.
+  > 2. It calls `MetadataStateMachine.compute_assignment()`. For new topic partitions, it walks the broker ring:
+  > `leader = live[start % len(live)]`, and replicas are assigned to the subsequent `replication_factor` brokers in the ring.
+  > This ring algorithm guarantees two properties: no broker appears twice in a partition's replica set, and partition leadership is distributed uniformly across the cluster.
+  > 3. Crucially, **the ring is used for initial placement, but NEVER for failover**. When an existing leader dies, `_elect_leader()` evaluates:
+  > `eligible = [n for n in replicas if n in committed_isr and n in live]`
+  > The controller strictly elects from the **committed In-Sync Replica (ISR)** set, because in-sync replicas are guaranteed to hold all records below the high watermark.
+  > If NO in-sync replica is alive, the controller refuses to elect anyone: `item['leader'] = previous` (retaining the dead leader). This implements `unclean.leader.election.enable=false`. The partition goes temporarily unavailable until an ISR replica revives, rather than electing an out-of-sync broker and silently discarding committed user data.
+  > 4. If leadership changed, `_stamp_epoch()` increments the partition's `leader_epoch`.
+  > 5. The controller proposes `ASSIGN_PARTITIONS` to Raft. Only when Raft commits does the placement take effect and get broadcast to peers."*
+- **Key mechanism to highlight**: Unclean leader election is disabled (`unclean.leader.election.enable=false`). If zero in-sync replicas are alive, the partition becomes unavailable rather than electing an out-of-sync broker and silently dropping data.
+- **Trap / Follow-up**: *"Why can't failover use the same ring algorithm used for initial partition placement?"* → The ring distributes load evenly assuming blank slates, but on failover the next node in the ring might hold zero replicated data. Failover must be constrained to the ISR.
+
+---
+
+## 23. Snapshotting the Raft log
+
+```
+_apply_committed()
+  └─ _maybe_snapshot()
+     ├─ last_applied - snapshot_last_index < threshold?  → return
+     ├─ snapshots.save(index, term, machine.snapshot())   FSYNC FIRST
+     └─ log.compact_to(index)                             destroy second
+```
+
+### Order is the entire safety argument
+
+Write the snapshot and fsync it, *then* truncate the log. Reverse them and a
+crash in between loses both copies of the same entries. The general rule for
+replacing A with B on disk: **B must be durable before A is destroyed.**
+
+`RaftLog._load` skips entries the snapshot already covers, which turns the
+crash window between the two steps into a no-op.
+
+### The sentinel moves; it is never deleted
+
+```python
+# broker/raft/log.py
+self._entries = [LogEntry(index, term, {'type': 'SENTINEL'})] + kept
+def _pos(self, index):
+    return index - self.snapshot_last_index
+```
+
+Compaction breaks the identity that every accessor rested on — *list position
+is the log index* — so all six go through `_pos()`. The sentinel's meaning
+changed (from "before time began" to "the last entry I folded in") but its job
+did not: be the thing a `prev_log_index` can legally point at when catching a
+follower up from the oldest entry we hold.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"To prevent infinite Raft log disk growth, nodes periodically snapshot their state machine and compact the log. The snapshot serializes the applied metadata state up to `last_included_index` and `last_included_term`. Once the snapshot is persisted and fsync'd, earlier log entries are discarded."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"In Raft consensus, the log cannot grow indefinitely. Flow 23 implements state machine log compaction in `_maybe_snapshot()`:
+  >
+  > 1. After applying committed entries, `RaftNode` checks if `last_applied - snapshot_last_index >= snapshot_threshold` (e.g. 500 entries).
+  > 2. If triggered, `machine.snapshot()` serializes the full metadata state machine (topics, partitions, assignments, ISRs) into bytes.
+  > 3. The snapshot manager writes `(last_applied_index, last_applied_term, snapshot_data)` to a file and executes `fsync()`.
+  > 4. Only AFTER the snapshot is physically fsync'd does `log.compact_to(last_applied_index)` discard superseded log entries.
+  >
+  > Disk ordering is the entire safety guarantee: **the replacement state must be durable on disk before the old log entries are destroyed**. If a crash occurs during compaction, startup recovery loads the snapshot and ignores duplicate log entries.
+  >
+  > 5. In memory, compaction breaks the simple invariant that list array index equals Raft log index. Our `RaftLog` replaces entry 0 with a sentinel entry representing `last_included_index` and `last_included_term`. All accessors map log indices through `_pos(index) = index - snapshot_last_index`. The sentinel provides an anchor so subsequent `AppendEntries` can verify `prev_log_index` and `prev_log_term` when replicating from the oldest retained entry."*
+- **Key mechanism to highlight**: Strict disk ordering: write and fsync the snapshot *before* truncating the log. If a crash occurs during compaction, loading `snapshot + log tail` remains deterministic and safe.
+- **Trap / Follow-up**: *"Why does the Raft log keep a sentinel entry at index 0 after compaction?"* → The sentinel holds `last_included_index` and `last_included_term`. It gives follower replication (`prev_log_index` / `prev_log_term`) a legal baseline reference when replicating from the oldest retained entry.
+
+---
+
+## 24. Catching up a follower that fell off the log
+
+```
+leader replicating to a peer
+  └─ raft/node.py  _replicate_once(peer)
+     ├─ next_index < log.first_index?
+     │   └─ _send_snapshot(peer)              INSTALL_SNAPSHOT (api 54)
+     │      └─ handle_install_snapshot()
+     │         ├─ term < current            → refuse (stale leader)
+     │         ├─ last_index <= commit_index → ignore (old snapshot)
+     │         ├─ snapshots.save(...)         durable first
+     │         ├─ machine.restore(state)      REPLACE, not merge
+     │         └─ log.reset_to_snapshot()     discard everything
+     └─ else: APPEND_ENTRIES with entries from next_index
+```
+
+**Compaction is what creates this failure.** Before it, "behind" was one state
+and always recoverable — back `next_index` up until the logs meet, and they
+always did, because index 1 was always there. After it, a follower can need an
+entry the leader has thrown away, and the leader cannot even build the message
+(`prev_log_term` is inside its snapshot).
+
+This is the only place in the system where **a node destroys committed local
+state because a peer told it to**. That is why the two guards are a fence
+rather than input validation: remove the term check and a stale leader rewinds
+a follower; remove the `commit_index` check and a duplicate packet does.
+
+`chaos/lagging_follower.py` shows a broker acquiring 12 topics whose log
+entries exist nowhere in the cluster.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"When a follower lags so far behind that its `next_index` precedes the leader's oldest retained log entry, standard `AppendEntries` cannot catch it up. The leader sends an `INSTALL_SNAPSHOT` RPC containing the compacted snapshot, resetting the follower's log baseline and state machine in one atomic step."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Log compaction introduces a new distributed failure mode: a follower that was offline or network-partitioned can fall behind further than the leader's oldest retained log entry.
+  >
+  > When the leader prepares `_replicate_once(peer)`:
+  >
+  > 1. It checks if `peer.next_index <= log.first_index`. If so, regular `AppendEntries` cannot catch up the follower because the preceding entries have already been deleted from the leader's disk.
+  > 2. The leader switches to `INSTALL_SNAPSHOT` (API key 54), transmitting its latest compacted snapshot.
+  > 3. When the lagging follower receives `INSTALL_SNAPSHOT`:
+  > - It checks `term < currentTerm`: if the sender is a stale leader, it rejects.
+  > - It checks `last_included_index <= commit_index`: if this is a duplicate or obsolete snapshot, it ignores it.
+  > - It writes the snapshot to disk with `fsync()`.
+  > - It calls `machine.restore(state)`: it completely replaces its in-memory metadata state machine with the snapshot's state.
+  > - It resets its Raft log via `log.reset_to_snapshot()`, discarding all local log entries up to `last_included_index`.
+  >
+  > This is the only flow in the system where **a node destroys its own committed local log because a remote peer ordered it to**. That is why the term fence and commit index fence are so rigorous: they guarantee that a rogue or stale partitioned leader can never rewind follower state."*
+- **Key mechanism to highlight**: A follower only accepts snapshots if the leader's term is current and the snapshot's index exceeds the follower's `commit_index`, preventing stale leaders or duplicate packets from rewinding committed state.
+- **Trap / Follow-up**: *"What is the primary limitation of our InstallSnapshot implementation?"* → The snapshot is transmitted in a single RPC payload rather than chunked streaming. This caps metadata capacity at roughly ~190,000 partitions before hitting TCP request size bounds.
+
+---
+
+## 25. Routing a client to the right broker
+
+```
+producer.send() / consumer.poll()
+  └─ cluster_client.py  leader_for(topic, partition)
+     ├─ cache hit and fresh?  → use it
+     └─ METADATA (api 3) to any broker
+        └─ returns leader, replicas, isr, leader_epoch per partition
+  └─ send to that broker
+     └─ NOT_LEADER_OR_FOLLOWER or FENCED_LEADER_EPOCH?
+        ├─ refresh metadata
+        └─ retry
+```
+
+**That pair is client-side failover.** There is no redirect and no proxy hop —
+the broker refuses and the client re-routes, which is why Kafka clients are
+thick libraries rather than thin HTTP wrappers.
+
+### Refusing is the whole point
+
+```python
+# broker/broker.py — _not_leader
+if not self.cluster.leads(topic, partition):
+    return _error(errors.NOT_LEADER_OR_FOLLOWER, ...)
+```
+
+Without this a broker asked for a partition it does not lead would happily
+create an empty local log and serve zero messages. The client would see an
+**empty topic** rather than an error — silent wrongness, which is the failure
+mode this project keeps trying to avoid.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"Clients maintain a local metadata cache mapping `(topic, partition) -> broker_id`. The client establishes direct TCP connections to the partition leader with no intermediate load-balancer proxy. When leadership moves, the broker returns `NOT_LEADER_OR_FOLLOWER`, prompting the client to refresh metadata and retry."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Kafka clusters do not use load balancers or proxy routers in front of brokers. Clients are 'thick' and manage direct leader routing:
+  >
+  > 1. `ClusterClient` maintains an in-memory routing cache: `_leaders[(topic, partition)] -> node_id` and `_brokers[node_id] -> (host, port)`.
+  > 2. When `producer.send()` or `consumer.poll()` executes, it calls `leader_for(topic, partition)`. If cached, it retrieves an open, pooled TCP socket to that broker from `_connections`.
+  > 3. If the cache is empty or stale (>30s TTL), it queries `METADATA` from any reachable bootstrap broker and updates its tables.
+  > 4. When the client sends a request to the cached broker:
+  > - If the broker is alive and still leads that partition, the request succeeds with zero routing hops.
+  > - If the leader died, the socket fails with `BrokerConnectionError`. The client drops the connection, invalidates its metadata cache, and retries once: the retry sends `METADATA` to any surviving broker, learns the newly elected leader, and connects directly to it.
+  > - If the broker is alive but no longer leads the partition (e.g. after failover), the broker checks `ClusterState.leads()`: it explicitly refuses with error code `NOT_LEADER_OR_FOLLOWER` (code 6). The client catches `NotLeaderError`, invalidates its cache, refreshes metadata, and retries.
+  >
+  > Refusing is the entire design: if brokers forwarded requests or opened missing partitions locally, clients would experience silent data corruption. Direct partition routing maximizes throughput and scales linearly with broker count."*
+- **Key mechanism to highlight**: Direct leader socket connections maximize throughput and eliminate proxy bottlenecks. Broker refusal (`NOT_LEADER_OR_FOLLOWER`) acts as the active cache invalidation mechanism, preventing brokers from serving silent empty reads for unled partitions.
+- **Trap / Follow-up**: *"Why not use a load balancer in front of the brokers?"* → A proxy adds extra network hops and CPU memory copies on data streams moving hundreds of thousands of messages per second. Smart clients routing directly to leaders scale linearly.
+
+---
+
+## 26. Failing over a partition leader
+
+The flow the whole of Phase 6 exists for.
+
+```
+broker holding orders-0 dies
+  └─ peers stop hearing its heartbeats
+     └─ cluster.live_brokers() drops it       (broker.session.timeout.ms)
+  └─ controller's next membership tick
+     └─ recompute() → assign_partitions()
+        ├─ _elect_leader: eligible = replicas ∩ committed ISR ∩ live
+        ├─ _stamp_epoch: leader changed → epoch + 1
+        └─ raft.propose(ASSIGN_PARTITIONS)    committed by a majority
+  └─ cluster.set_placement() everywhere
+     ├─ new leader stops fetching this partition (it leads now)
+     └─ other replicas start fetching FROM IT
+  └─ clients get NOT_LEADER_OR_FOLLOWER → refresh → retry
+```
+
+### Why the promotion is safe
+
+An in-sync replica holds everything below the high watermark **by definition**.
+A consumer could only ever read below the watermark. Therefore every record any
+consumer was allowed to act on is already on the new leader — which is the
+whole reason the ISR is maintained as agreed state rather than a leader's
+private opinion.
+
+### Fencing the broker that has not heard
+
+```python
+# broker/broker.py — _not_leader
+if theirs > mine:
+    return _error(errors.FENCED_LEADER_EPOCH,
+                  f"broker {self.node_id} believes it leads ... at epoch "
+                  f"{mine}, but the caller knows epoch {theirs}")
+```
+
+The caller knowing a *newer* epoch is the only way this broker can discover it
+is stale. Journal #31: the first version compared these backwards — refusing
+the stale *client* instead of the stale *broker* — and fenced nothing, with
+every test passing.
+
+### What this flow does NOT protect
+
+An **isolated** leader with an **unaware** client. Neither side knows a newer
+epoch, so nothing objects, and `acks=1` writes go into a log nobody will read.
+
+```
+acks=all   acked 201   readable 201   LOST 0
+acks=1     acked 400   readable 200   LOST 200
+```
+
+What protects that case is `acks=all` — an isolated leader cannot satisfy it,
+because its ISR has collapsed to itself. `chaos/kill_leader.py` runs both.
+
+### How to explain this in an interview
+
+- **The 30-second pitch**: *"When a leader dies, heartbeats stop and the controller notices during `recompute()`. It promotes an in-sync replica from the committed ISR, bumps the `leader_epoch`, and commits the new assignment through Raft. Clients encountering connection errors or `NOT_LEADER_OR_FOLLOWER` refresh metadata and retry against the new leader."*
+- **Full deep-dive explanation (2–3 minutes)**:
+  > *"Leader failover is the core fault-tolerance mechanism of Phase 6:
+  >
+  > 1. **Detection**: Broker 1 dies. Peers stop receiving its heartbeats. After `broker_session_timeout_ms` (e.g. 3s) of silence, `ClusterState.live_brokers()` drops broker 1 on all surviving nodes.
+  > 2. **Reassignment**: On the controller's next membership tick, `controller.recompute()` notices a dead leader. It calls `assign_partitions()` and invokes `_elect_leader()`:
+  > It filters candidate replicas by `replicas ∩ committed_isr ∩ live_brokers`. Because the new leader is selected from the In-Sync Replica set, it is mathematically guaranteed to already hold all records below the high watermark. Zero committed records are lost.
+  > 3. **Leader Epoch Fencing**: The controller increments `leader_epoch` for that partition via `_stamp_epoch()`.
+  > 4. **Commit & Broadcast**: The controller proposes `ASSIGN_PARTITIONS` to the Raft quorum. Once committed by a majority, it updates `ClusterState` and broadcasts `CONTROLLER_UPDATE` to all surviving brokers. The promoted replica stops its follower fetcher loop and opens the partition for active client reads and writes.
+  > 5. **Client Redirection**: Clients attempting to write to the old leader encounter connection refusals or `NOT_LEADER_OR_FOLLOWER`. They refresh metadata, discover the new leader, and retry.
+  > 6. **Zombie Leader Fencing**: If the old leader was merely network-isolated and comes back online still believing it leads the partition, any client that has already refreshed metadata sends the new `leader_epoch`. The zombie broker detects `theirs > mine` and refuses with `FENCED_LEADER_EPOCH`.
+  >
+  > Furthermore, `acks=all` with `min.insync.replicas` protects against an isolated leader whose clients have not yet refreshed: the isolated leader cannot satisfy `acks=all` because its ISR has collapsed to itself, rejecting writes before data loss can occur."*
+- **Key mechanism to highlight**: Leader epoch fencing: every partition has an epoch counter incremented on leadership changes. If a client sends a newer epoch to a stale, zombie broker, the broker refuses with `FENCED_LEADER_EPOCH`.
+- **Trap / Follow-up**: *"Can messages be lost during a leader failover?"* → With `acks=all`, 0 messages are lost (proven in `chaos/kill_leader.py` — 0 lost of 201 acked) because writes only commit after reaching the high watermark. With `acks=1`, messages written to the leader's page cache but not yet fetched by followers are lost when that leader dies (201 lost of 400).
+
+---
+
+## Reading order for the cluster flows
+
+If you want to follow the distributed half end to end:
+
+**19** (a cluster forms) → **20** (it elects a controller) → **21** (how any
+decision is agreed) → **22** (what the controller decides) → **26** (what
+happens when a broker dies).
+
+Flows **23** and **24** are the Raft log's own housekeeping and can be read
+later. Flow **25** is the client's half of everything above.

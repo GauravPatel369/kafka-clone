@@ -876,6 +876,183 @@ reader with 20,000 partitions would have been told to chunk for no reason.
 
 ---
 
+## 29. Eleven passing tests, and every partition had one copy
+
+**Phase 6 · [broker/broker.py](../broker/broker.py) · [broker/raft/machine.py](../broker/raft/machine.py)**
+
+**What happened.** Step 1 of replication added replica sets: `compute_assignment`
+grew a replication factor, walked the broker ring, and returned
+`{leader, replicas}`. Eleven unit tests pinned down every property that
+mattered — no duplicate brokers in a set, leadership still spread evenly,
+deterministic output, per-topic factors, clamping to the cluster size. All
+green.
+
+Then a real three-broker cluster created `orders` with `replication_factor=3`
+and printed this:
+
+```
+orders-0    1        [1]
+orders-1    2        [2]
+```
+
+**Why.** `CREATE_TOPIC` carried the partition count and *not* the factor. The
+factor was written into the local `MetadataStore` of whichever broker served
+the request — but placement runs on the **controller**, which need not be that
+broker, and reads its own store. The number never travelled.
+
+A second bug sat behind it: `ensure_topic` returned early when the width
+already matched, so even a broker that *did* learn the factor would not have
+applied it.
+
+**The fix.** Commit `replication_factor` inside the `CREATE_TOPIC` command,
+keep it in the state machine, carry it through `snapshot`/`restore`, and let
+`ensure_topic` adopt a changed factor in either direction — width is
+structural and may only widen, a factor is policy and may go down.
+
+**What it taught.** The tests were not weak; they were aimed one layer too
+deep. Every one called `compute_assignment` directly, and **a test that hands
+the algorithm its inputs can never discover that the inputs never arrive.**
+This is the same shape as #24 (an in-memory transport with no slow peers) and
+#28 (a number nobody measured): the unit is right, and the wiring around it is
+what is wrong. The scratchpad script that started three real brokers found it
+in one run.
+
+The rule this project keeps re-learning: **exercise the seam, not the
+function.** Phase 6's later steps get an end-to-end check before their unit
+tests are believed.
+
+---
+
+## 30. The ISR froze at `[1]`, and `acks=all` was 358x slower
+
+**Phase 6 · [broker/controller.py](../broker/controller.py) · [broker/replica.py](../broker/replica.py)**
+
+Steps 4 and 5 passed every unit test and then failed twice on three real
+brokers, in ways the unit tests structurally could not see. Both are the same
+mistake wearing different clothes: **reasoning about a component while ignoring
+who it actually talks to.**
+
+### The ISR that could never grow
+
+`_observed_isr` had two branches — *I lead this partition, so I can see the
+lag* and *I do not, so carry the committed value forward*. Correct-looking, and
+fatal, because **the controller usually leads none of the partitions it is
+placing.**
+
+```
+ctl=2 leader=1
+t=0.0  committed_isr=[1]  observed=[2]  proposed=[[1]]  differs=False
+t=3.5  committed_isr=[1]  observed=[2]  proposed=[[1]]  differs=False
+```
+
+The ISR was committed as `[1]` in the instant before the followers first
+fetched, and then nothing could ever change it: broker 2 was the controller and
+had no fetches to observe, so it carried `[1]` forward forever. Every
+`acks=all` write failed `min.insync.replicas` on a cluster with nothing wrong
+with it, permanently.
+
+**Fix:** partition leaders report their own ISR on the heartbeat they were
+already sending, and the controller aggregates. A report is only believed from
+the broker that actually leads that partition.
+
+### The leader that lied about its replicas
+
+Isolate a leader that is *also* the controller and it cannot commit anything —
+including the news that its followers have gone. It kept reporting
+`ISR [1, 2, 3]` from the last committed value while observing `[1]`, and
+accepted `acks=all` writes claiming three copies while holding one.
+
+**Fix:** acceptance uses the **intersection** of committed and observed. That
+can only ever be smaller, which is the safe direction — a leader may refuse a
+write it could have taken, and may never take one it should refuse.
+
+### 358x
+
+```
+acks=1     1,637 msg/s   p50   0.36 ms
+acks=all       5 msg/s   p50 218.19 ms      → 358x
+```
+
+218 ms is not a coincidence: it is `REPLICA_FETCH_IDLE_MS`, exactly. **A
+producer waiting for replication was waiting for the follower's sleep
+schedule.** A follower discovers records by asking, so `acks=all` costs
+*however long until the follower next asks* — not a round trip.
+
+**Fix:** long-polling. The leader holds an empty fetch open (`max_wait_ms`)
+instead of answering "nothing", and returns the instant a record lands. That is
+what Kafka's `fetch.max.wait.ms` is for. 358x → ~6x.
+
+### What it taught
+
+The prediction in the phase doc said `acks=all` would cost 30–50%. The measured
+cost is ~600%, and the reasoning error is the interesting part: the prediction
+priced replication as a **network** cost (0.035 ms of loopback RTT) when it is
+really a **scheduling** cost — an append, a poll, an append, another poll to
+report the position, and a leader noticing.
+
+That is the third time this project has been wrong about a number by reasoning
+from an architecture diagram instead of from what the code actually waits on
+(#7 pipelining, #28 the snapshot ceiling). The tell is the same every time:
+**a prediction that names a mechanism but not a wait.**
+
+---
+
+## 31. A fencing check pointed the wrong way, and fenced nothing
+
+**Phase 6 step 6 · [broker/broker.py](../broker/broker.py)**
+
+**What happened.** Leader-epoch fencing went in: the controller bumps a
+per-partition epoch whenever leadership changes, commits it through Raft,
+`METADATA` hands it to clients, and clients send it back on produce and fetch.
+`_not_leader` compares it. All 315 tests passed.
+
+Then a direct check, on three real brokers:
+
+```
+after failover: leader=2 epoch=2
+  old leader 1 still thinks epoch=1, leads=True
+  produce to STALE leader carrying epoch 2 → error_code=0     ← fenced nothing
+```
+
+**Why.** The comparison was backwards. I had written:
+
+```python
+if int(epoch) < current:        # the CLIENT is stale
+```
+
+which is the harmless direction — we still lead the partition, so serving the
+request is correct. The dangerous case is the mirror image: **the caller knows
+a *newer* epoch than the broker does.** The only way that can happen is that
+leadership moved and this broker has not heard — which is precisely the
+data-plane split-brain the mechanism exists to stop.
+
+**The fix.** Check both, with the important one first:
+
+```python
+if theirs > mine:   # THIS BROKER is stale — the case the feature is for
+if theirs < mine:   # the caller's map is old; refuse so it refreshes
+```
+
+After it, the same call returns `error_code=74`, *"broker 1 believes it leads
+orders-0 at epoch 1, but the caller knows epoch 2; this broker is stale."*
+
+**What it taught.** Everything around the check was right — the epoch was
+computed correctly, committed correctly, propagated correctly, and the error
+code existed with a good docstring. The single comparison operator was
+inverted, and **a fencing check pointed the wrong way is indistinguishable
+from a working one until something is actually stale.** No unit test would
+have caught it, because a unit test would have asserted whatever the
+implementation did.
+
+The general form, and the fourth time this project has met it: **a guard is
+only tested by the thing it guards against.** Journal #24 needed a *slow* dead
+peer, #29 needed a real controller that led no partitions, #30 needed a leader
+cut off from its own quorum. This needed a broker that had genuinely lost
+leadership without knowing. In every case the ingredient was a real failure,
+not a mock of one.
+
+---
+
 ## Cross-cutting lessons
 
 **Measure the claim, and keep the number that argues against you.** Phase 1's
