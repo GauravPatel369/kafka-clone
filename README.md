@@ -29,18 +29,27 @@ Two ways in, depending on how you like to learn:
 
 Then follow the phases in order. Each has its own doc.
 
+Want the whole system explained in one pass?
+**[docs/architecture.md](docs/architecture.md)** is the "how this Kafka is
+built" walkthrough — the shape of the system, one message traced end to end,
+then each subsystem in the order you need to understand it. Start here if you
+have to *explain* the project to someone.
+
 Preparing to be asked about this? **[docs/interview-questions.md](docs/interview-questions.md)**
 maps every concept here to the questions it gets asked as, with the measured
-numbers from this repo to answer them with.
+numbers from this repo to answer them with — and opens with a timed 3–4 minute
+spoken pitch.
 
 Want to know exactly how a given flow is implemented?
-**[docs/flows.md](docs/flows.md)** traces every path — produce, fetch, rebalance,
-commit, retention, recovery — through the real call sequence, with file, line
-and code for each step.
+**[docs/flows.md](docs/flows.md)** traces all **26 paths** through the real call
+sequence with the code for each step — produce, fetch, rebalance, commit,
+retention and recovery for a single broker (1–18), then controller election,
+Raft commits, placement, snapshots, client routing and partition failover for
+the cluster (19–26).
 
 Want the wrong turns rather than the clean result?
 **[docs/challenges-and-solutions.md](docs/challenges-and-solutions.md)** is the
-development journal: twenty-eight real bugs, wrong predictions, and design dead
+development journal: thirty-one real bugs, wrong predictions, and design dead
 ends — what broke, how it was caught, and what fixed it.
 
 ---
@@ -81,6 +90,7 @@ python -m chaos.kill_consumer              # kill a consumer, watch failover + f
 python -m chaos.kill_controller            # kill the controller, watch re-election
 python -m chaos.split_brain                # partition the network, count the controllers
 python -m chaos.lagging_follower           # compact past a follower, watch InstallSnapshot rescue it
+python -m chaos.kill_leader                # kill a leader mid-produce: acks=all loses 0, acks=1 loses 201
 python -m bench.bench --count 20000        # throughput, percentiles, seek profile
 pytest -q                                  # the test suite
 ```
@@ -94,7 +104,7 @@ in ~1 s, then shows the "dead" consumer coming back and being refused.
 
 ---
 
-## Architecture today (end of Phase 5)
+## Architecture today (end of Phase 6)
 
 ```
    ┌──────────┐                                    ┌──────────┐
@@ -124,6 +134,16 @@ Consumers sharing a `group_id` form a group: the coordinator divides the
 topic's partitions among them, one member each, and reassigns when a member
 stops heartbeating. A generation number fences a member that was evicted while
 paused, so its late commit cannot rewind the group.
+
+Each partition is **copied to several brokers**. One leads and takes every read
+and write; the others run a fetch loop against it, appending the leader's
+records with the leader's offsets — a follower is a consumer with a
+`replica_id`. A consumer may only read up to the **high watermark**, the
+highest offset every in-sync replica holds, so no consumer can act on a record
+that a failover could erase. A replica that stops fetching leaves the **ISR**
+so it cannot freeze that watermark, and `acks=all` with `min.insync.replicas`
+refuses a write outright when too few copies remain — availability given up for
+durability, on purpose.
 
 A partition is a **directory of segments**, each named by the offset of its
 first record. One segment is active and takes appends; the rest are sealed and
@@ -159,7 +179,7 @@ clients decide what to retry without parsing English.
 | **3** | [Partitioning](docs/phase-3/phase-3-partitioning.md) | Key hashing, batching, `acks`, retries, PRODUCE v1 — **load balancing** | ✅ done |
 | **4** | [Consumer groups](docs/phase-4/phase-4-consumer-groups.md) | Coordinator, rebalancing, generation fencing, server-side offsets | ✅ done |
 | **5** | [Cluster](docs/phase-5/phase-5-cluster.md) | Multi-broker, membership, **Raft** controller election, client routing | ✅ done |
-| 6 | Replication | Leader/follower, ISR, high watermark, failover — **fault tolerance** | next |
+| **6** | [Replication](docs/phase-6/phase-6-replication.md) | Leader/follower, ISR, high watermark, `acks=all`, failover — **fault tolerance** | ✅ done |
 | 7 | Capstone | Full demo, benchmark table, honest limitations | |
 
 Every phase is runnable on its own. Check out any phase's final commit and the
@@ -189,6 +209,7 @@ common/     protocol.py   wire format: encode/decode
 broker/     broker.py     asyncio TCP server, request routing
             cluster.py    membership, liveness, the local leader map
             controller.py placement, proposed through Raft
+            replica.py    follower fetch loops: a follower is just a consumer
             raft/         state.py    durable currentTerm and votedFor
                           log.py      the replicated log, election restriction
                           node.py     follower / candidate / leader
@@ -212,6 +233,7 @@ tests/      conftest.py   real broker on an ephemeral port
 bench/      bench.py      throughput + latency percentiles
 chaos/                    scripts that break things on purpose
 docs/       00-overview.md          concepts, before any code
+            architecture.md         the whole system explained in one pass
             benchmarks.md           one row per phase
             flows.md                every code path, traced end to end
             interview-questions.md  concepts → questions, with our numbers
@@ -221,18 +243,27 @@ docs/       00-overview.md          concepts, before any code
             phase-3/                partitioning + batching
             phase-4/                consumer groups
             phase-5/                the cluster + Raft snapshots
+            phase-6/                replication
 ```
 
 ---
 
-## Known limitations at Phase 5
+## Known limitations at Phase 6
 
 Stated plainly, because a system that only lists its strengths is a sales
 pitch:
 
-- **Losing a broker loses its data.** Partitions are spread across brokers but
-  not replicated: a reassigned partition starts empty on its new leader.
-  Phase 6.
+- **Epoch fencing needs somebody to know the newer number.** A stale leader is
+  refused when a client that has refreshed its metadata sends the newer epoch,
+  or once the broker itself learns it was replaced. An *isolated* leader with
+  an *unaware* client can still accept `acks=1` writes that will be lost —
+  `chaos/kill_leader.py` loses 201 messages exactly this way. What protects
+  that case is `acks=all`, which an isolated leader cannot satisfy. The
+  alternative would be a leader that stops serving when it cannot reach its own
+  ISR; Kafka does not do this either.
+- **No idempotent producer.** So `acks=all` is at-least-once: a producer that
+  times out must retry, and the retry can duplicate. Kafka's
+  `(producer_id, sequence)` dedup is what closes this.
 - **No leader epoch fencing.** Raft fixed the *control* plane: a minority can
   no longer elect a controller, so two brokers cannot both decide who leads a
   partition. It did not fix the *data* plane — a stale broker will still accept
@@ -255,8 +286,12 @@ pitch:
   largely uncompressed JSON.
 - **Unbounded producer memory.** A real producer has `buffer.memory` and blocks
   when it is full, applying backpressure. Ours grows until the process dies.
-- **No idempotent producer.** `max_in_flight` defaults to 1 because a retried
-  batch could otherwise land after a later one and reorder a partition.
+- **No idempotent producer, so only one batch is in flight at a time.** A
+  retried batch could otherwise land after a later one and reorder a partition.
+  Kafka permits 5 in flight *because* `(producer_id, sequence)` lets a broker
+  reject an out-of-order batch; without that there is nothing safe to raise it
+  to, so the pipelining Phase 1's correlation IDs made possible is unused on
+  the produce path.
 - **Partition counts are immutable.** Stricter than Kafka, which permits
   increases. See `chaos/partition_balance.py` for why changing them is costly.
 - **No compaction.** Retention deletes old segments; it cannot keep the latest
